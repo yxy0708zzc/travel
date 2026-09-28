@@ -1,0 +1,28 @@
+# 环境与密钥（绝不上传）
+.env
+
+# 数据流产物（各 step 的输入输出，本地生成）
+data/
+question/
+logs/
+*.db
+*.db.tmp
+*.db-journal
+
+# 输出类 xlsx（模板在 templates/，回执/报告类产物不入库）
+*_回执*.xlsx
+*_失败*.xlsx
+failure_report.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
