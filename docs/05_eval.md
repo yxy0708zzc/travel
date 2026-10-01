@@ -14,9 +14,10 @@
 
 eval 语义：
 - 待测集合 = 全部测试记录 − 已测评（由结果文件 `test_file` 字段识别）；
-  `--ids` 指定、`--re-evaluate` 强制重测。
-- **空方案口径统一**：final_plan 为空时核查结果覆写为 `verdict=empty_plan`
-  （与核查端对空方案的处理一致，不因批量路径漂移成 no_plan）。
+  `--ids` 指定、`--re-evaluate` 强制重测（重测成功后删除该记录旧结果，不重复计数）。
+- **空方案细分**：final_plan 为空时按测试记录 `plan_status` 区分——模型明确
+  输出空数组（无解）→ `empty_plan`；未输出 final_plan JSON（轮数用尽/格式错误）
+  → `no_plan`，统计不再混同。
 - 结果文件结构：`{timestamp, test_file, question_id, model_name, user_input,
   score_summary{hallucination_count, issue_count, total_tokens, duration_seconds},
   verification, human_confirmed:false, human_notes, status}`；文件名含微秒。
@@ -44,14 +45,16 @@ eval 语义：
 - 非法席别 → `invalid_seat`。
 
 ### 层2a 存在性题：对标 ground_truth（答案唯一）
-每段与标答做四维比对，细分问题码：
+先做**反向覆盖检查**：标答每段都必须被提交，漏段 → `missing_gt_segment`
+（防「只交第一段就 pass」的方案不完整）；再对每段与标答做四维比对，细分问题码：
 `route_mismatch_train`（车次）/ `route_mismatch_route`（购买区间）/
 `route_mismatch_seat`（座位）/ `route_mismatch_ride`（乘坐区间）；
 四维全同但整体不符才落兜底 `route_mismatch`。
 另有**两类题通用**：声称票数 < 需求人数 → `ticket_shortage`。
 
-### 层2b 选择性题：全程可达性（check_reachability）
-拼接全部段的实际乘坐区间，检查：
+### 层2b 选择性题：座位等级 + 全程可达（check_reachability）
+先查**座位等级**：每段席别必须等于题目要求的 seat_type → 否则 `seat_mismatch`。
+再拼接全部段的实际乘坐区间，检查：
 1. **地点连续**：后段乘坐起点 == 前段乘坐终点 → 否则 `route_discontinuity`；
 2. **时间顺序**：跨车次时前段到达 ≤ 后段发车 → 否则 `transfer_time_conflict`。
    双侧必须均为合法 HH:MM（防 "--" 脏数据字典序误报）。字符串比较遇跨天
@@ -72,7 +75,7 @@ eval 语义：
 ### verdict 判定
 `issues` 为空 → `pass`；非空 → `hallucination`。
 外加两种前置短路：无可核查购票段 → `no_plan`；题目库缺失 → `db_not_found`。
-（`empty_plan` 由 eval 侧对空方案统一覆写。）
+（eval 侧对空方案按测试记录 plan_status 细分为 `empty_plan`/`no_plan`。）
 
 ## 3. 问题码全表
 
@@ -84,7 +87,9 @@ eval 语义：
 | hallucination | 余票不符 | 余票与票价 | 声称合计 > 库内余票 |
 | price_wrong | 票价不符 | 余票与票价 | 差价 > 1.0 元 |
 | ticket_shortage | 票数不足 | 路线与标答 | 声称 < 需求人数 |
+| missing_gt_segment | 漏交标答段 | 路线与标答 | 存在性题反向覆盖：标答段未被提交 |
 | route_mismatch_train/route/seat/ride(/整体) | 与标答不一致 | 路线与标答 | 存在性题四维比对 |
+| seat_mismatch | 座位不符 | 路线与标答 | 选择性题购买席别 ≠ 题目要求席别 |
 | route_invalid | 路线段无效 | 全程可达 | 车次不经停/方向反/缺信息 |
 | route_discontinuity | 路线不连续 | 全程可达 | 前段终点 ≠ 后段起点 |
 | transfer_time_conflict | 换乘时间冲突 | 全程可达 | 前段到达晚于后段发车（含跨天） |

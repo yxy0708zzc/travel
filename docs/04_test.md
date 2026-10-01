@@ -7,7 +7,7 @@
 
 ```
 python step4_test.py --railway-db ... --prices-db ... --question-dir ... \
-    --metadata ... --logs-test logs/test \
+    --metadata ... [--metadata-nl ...] --logs-test logs/test \
     [--model M] [--api-key K] [--base-url U] [--ids q1 q2] [--list] \
     [--max-iterations 30] [--concurrency 3] [--env .env]
 ```
@@ -99,9 +99,10 @@ messages = [SYSTEM_PROMPT, user=nl_question]
   `{"final_plan": []}`，取首个会把有解误判成 empty_plan）→ 向左找最近 `{` →
   **字符串感知的花括号配对扫描**（字符串内的 {} 不计深度、跟踪转义）。
 - 兜底：最后一个 ```json 代码块（须含 "final_plan" 键）。
-- 解析出的条目经 `verifier.normalize_final_plan` 归一（无效条目剔除）。
+- 条目**原样保留落盘**（不做无效剔除）：剔除会让 verifier 的 `invalid_plan_item`
+  检查永远触发不了，全非法时还会被误判成「明确无解」。
 - 三态：解析不到 JSON → `no_plan`（未输出）；JSON 且 plan 为空 → `empty_plan`
-  （明确无解）；有有效条目 → `has_solution`。
+  （明确无解）；有内容（含非法条目）→ `has_solution`。
 
 ## 7. 执行建议
 

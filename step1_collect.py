@@ -8,7 +8,7 @@ step1_collect.py —— 数据爬取与处理：12306 余票/票价采集、数�
 - prices：相邻站对票价（queryAllPublicPrice；同车多号轮替、3轮×5次×逐天重试、
   高铁/普速席别映射+兜底）→ 非相邻段离线累加；--resume 断点续爬 / --supplement 补缺
 - cleanup：同车多号去重（主号=trains 中票价记录最多者）→ 非相邻段补算 →
-  删除仍不全车次（零票价记录保护）→ 重建 station_trains；--check 只读体检
+  删除仍不全车次 → 重建 station_trains；--check 只读体检
 - overnight：跨天车（相邻实际 stop_no 配对、时间倒退、双侧 HH:MM 校验）；--apply 才删
 - check：只读体检（表计数/缺电报码/缺时间/跨天/票价完整性概览）
 - all：tickets → prices → cleanup → overnight → check 串行全流程
@@ -64,17 +64,21 @@ def _norm_station(name: str) -> str:
 
 
 class RateLimiter:
-    """相邻请求间隔 ≥ min_interval（monotonic 时钟，限速防反爬）"""
+    """相邻请求间隔 ≥ min_interval（monotonic 时钟，限速防反爬）。
+    加锁：prices --workers>1 时多线程共享实例，判定+更新原子化，
+    否则并发可同时通过间隔检查，全局请求间隔被击穿、易触发反爬。"""
 
     def __init__(self, min_interval: float):
         self.min_interval = min_interval
         self._last = 0.0
+        self._lock = threading.Lock()
 
     def wait(self):
-        now = time.monotonic()
-        if self._last > 0 and now - self._last < self.min_interval:
-            time.sleep(self.min_interval - (now - self._last))
-        self._last = time.monotonic()
+        with self._lock:
+            now = time.monotonic()
+            if self._last > 0 and now - self._last < self.min_interval:
+                time.sleep(self.min_interval - (now - self._last))
+            self._last = time.monotonic()
 
 
 def is_anticrawl(resp: Optional[requests.Response]) -> bool:
@@ -100,7 +104,17 @@ class HttpBase:
     def __init__(self, backoff: str = "collector"):
         cfg = config.CRAWLER_CONFIG
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": cfg["user_agent"]})
+        # 请求头档位与退避口径同源：price 档带参考 price_collector 的完整浏览器仿真头；
+        # collector 档与参考 collector 一致仅 UA
+        headers = {"User-Agent": cfg["user_agent"]}
+        if backoff == "price":
+            headers.update({
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+            })
+        self.session.headers.update(headers)
         self.rate = RateLimiter(cfg["min_interval"])
         self.max_retries = cfg["max_retries"]
         self.timeout = cfg["request_timeout"]
@@ -220,7 +234,11 @@ class TicketCrawler(HttpBase):
         """枚举 G10-G99 覆盖全部两位前缀，再补 G1-G9 本身（逐前缀打印，无新增不打）"""
         self.g_trains = {}
         for tens in range(1, 10):
+            if _SHUTDOWN:
+                break
             for ones in range(10):
+                if _SHUTDOWN:
+                    break
                 prefix = f"{tens}{ones}"
                 trains = self._search_by_prefix(prefix)
                 new_count = sum(1 for tn in trains if tn not in self.g_trains)
@@ -230,6 +248,8 @@ class TicketCrawler(HttpBase):
                     self.g_trains.setdefault(tn, no)
                 print(f"[车次]   G{prefix} → 新增 {new_count}，累计 {len(self.g_trains)}")
         for d in range(1, 10):
+            if _SHUTDOWN:
+                break
             exact = self._search_by_prefix(str(d)).get(f"G{d}")
             if exact:
                 self.g_trains[f"G{d}"] = exact
@@ -300,6 +320,9 @@ class TicketCrawler(HttpBase):
             cur.execute("DELETE FROM train_stops")
             cur.execute("DELETE FROM stations WHERE station_id LIKE '@%'")
             for idx, (tn, no) in enumerate(self.g_trains.items(), 1):
+                if _SHUTDOWN:
+                    print(f"[经停] 收到中断信号，停止遍历（已处理 {idx - 1}/{total}）")
+                    break
                 if idx % 20 == 0:
                     print(f"[经停] 进度 {idx}/{total}")
                 stops = self.collect_train_stops(tn, no)
@@ -336,15 +359,15 @@ class TicketCrawler(HttpBase):
     def build_same_train_map(self, conn: sqlite3.Connection):
         """经停序列（站名+时刻）完全一致 → 同一物理列车。缺有效时间的车次不参与分组
         （key 会退化为纯站名序列，可能误合并经停相同但时刻不同的合法车）。"""
-        per_train: Dict[str, List[str]] = defaultdict(list)
+        per_train: Dict[str, List[Tuple[str, str]]] = defaultdict(list)
         for tn, name, tm in conn.execute(
                 "SELECT train_num, station_name, stop_time FROM train_stops "
                 "ORDER BY train_num, stop_no"):
-            per_train[tn].append(f"{name}:{tm}")
+            per_train[tn].append((name, tm))   # 时刻独立保存：tm 自带冒号，不可拼串后 split 取尾
         seq_map: Dict[str, List[str]] = defaultdict(list)
         for tn, seq in per_train.items():
-            if all(re.fullmatch(r"\d{2}:\d{2}", s.split(":")[-1]) for s in seq):
-                seq_map["|".join(seq)].append(tn)
+            if all(re.fullmatch(r"\d{2}:\d{2}", tm) for _name, tm in seq):
+                seq_map["|".join(f"{name}:{tm}" for name, tm in seq)].append(tn)
         out = [{"trains": sorted(trains), "count": len(trains)}
                for trains in seq_map.values() if len(trains) > 1]
         path = db.same_train_map_path()
@@ -452,6 +475,7 @@ class PriceCollector(HttpBase):
         self._log_lock = threading.Lock()
         self.failed_log = os.path.join(os.path.dirname(db._path("prices_db")),
                                        "failed_pairs.log")
+        os.makedirs(os.path.dirname(self.failed_log), exist_ok=True)   # prices-db 父目录可能尚不存在
         with open(self.failed_log, "a", encoding="utf-8") as f:
             f.write(f"\n--- {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
         self.total_pairs = self.success_count = self.fail_count = 0
@@ -708,8 +732,8 @@ class PriceCollector(HttpBase):
         self._report()
 
     def supplement(self):
-        """补缺：候选=trains 全集 ∪ prices 已有号（零票价记录车次也能被扫到补爬，
-        避免被 cleanup 误删）；只爬缺失相邻站对，不删已有数据"""
+        """补缺：候选=trains 全集 ∪ prices 已有号（全量爬取全失败的零票价车次
+        也能被扫到）；只爬缺失相邻站对，不删已有数据"""
         db.init_prices_table()
         print("[DB] prices 表已就绪")
         if not self.init_session():
@@ -940,7 +964,7 @@ def _rebuild_and_report(deleted: list, skipped: list, need_rebuild: bool):
 
 
 def run_cleanup(check_only: bool):
-    """一键清理：①同车多号去重 ②非相邻段补算 ③删仍不全（零票价保护）④重建；--check 只读"""
+    """一键清理：①同车多号去重 ②非相邻段补算 ③删仍不全 ④重建；--check 只读"""
     plan = find_duplicate_trains()
     remove = sorted(set(plan["duplicates"]) | set(plan["pure_orphans"]))
     print("=" * 60)
@@ -989,23 +1013,17 @@ def run_cleanup(check_only: bool):
         _rebuild_and_report(remove, [], True)
         return
 
-    print(f"\n自动删除仍不全的 {len(incomplete)} 个车次（零票价记录保护生效）...")
-    deleted, skipped_noprice, need_rebuild = [], [], False
-    pr = sqlite3.connect(_pr_path())
-    try:
-        for info in incomplete:
-            tn = info["train_num"]
-            if pr.execute("SELECT COUNT(*) FROM prices WHERE train_num=?",
-                          (tn,)).fetchone()[0] == 0:
-                skipped_noprice.append(tn)   # prices 0 行=全量爬取全失败，可被 supplement 补，不删
-                print(f"  ⏭ {tn}: prices 无任何记录，跳过删除（建议 prices --supplement 补爬）")
-                continue
-            result = delete_train_completely(tn)
-            deleted.append(tn)
-            need_rebuild = need_rebuild or result["success"]
-    finally:
-        pr.close()
-    _rebuild_and_report(deleted, skipped_noprice, need_rebuild)
+    print(f"\n自动删除仍不全的 {len(incomplete)} 个车次...")
+    deleted, need_rebuild = [], False
+    for info in incomplete:
+        tn = info["train_num"]
+        result = delete_train_completely(tn)
+        deleted.append(tn)
+        status = "✅" if result["success"] else "⚠️"
+        print(f"  {status} {tn}: {'; '.join(result['details'])}")
+        if result["success"]:
+            need_rebuild = True
+    _rebuild_and_report(deleted, [], need_rebuild)
 
 
 def run_overnight(apply: bool):

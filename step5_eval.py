@@ -3,7 +3,8 @@ step5_eval.py —— 测评与统计：核查测试记录 → 结果落盘 → �
 
 复刻参考项目工作流（语义 1:1）：
 - eval：读 logs/test 测试记录 → verifier 核查 → 结果写 logs/result → state=evaluated；
-  空方案统一覆写为 empty_plan（与核查端口径一致，不因批量路径漂移成 no_plan）
+  空方案按测试记录 plan_status 细分 verdict（模型明确无解=empty_plan / 未输出 JSON=no_plan），
+  不再一律覆写成 empty_plan；重测时删除同测试记录的旧结果，避免重复计数
 - stats：按模型聚合 verdict 分布/通过率/token/耗时/模型与工具调用计数/问题码分布
 - report：模型 pass_rate 排名 + 题型（存在性/选择性、五题型）难度对比 + 洞察，
   导出 JSON 与 Markdown 到 --report-dir（JSON 只保留最近 50 份）
@@ -52,9 +53,14 @@ def load_results(logs_result: str) -> list:
     return results
 
 
-def evaluated_test_files(logs_result: str) -> set:
-    """已测评的测试记录文件名集合（结果文件的 test_file 字段）"""
-    return {r.get("test_file") for r in load_results(logs_result) if r.get("test_file")}
+def evaluated_test_files(logs_result: str) -> dict:
+    """test_file → 旧结果文件名列表（--re-evaluate 重测时删除旧结果，防重复计数）"""
+    out: dict = {}
+    for r in load_results(logs_result):
+        tf = r.get("test_file")
+        if tf:
+            out.setdefault(tf, []).append(r.get("_filename", ""))
+    return out
 
 
 def verdict_of(result: dict) -> str:
@@ -104,19 +110,30 @@ def run_eval(logs_test: str, logs_result: str, ids: list, re_evaluate: bool):
             qid = data.get("question_id", "") or "unknown"
             final_plan = data.get("final_plan") or []
             verification = verify_final_plan(final_plan, qid)
+            plan_status = str(data.get("plan_status") or "")
             if not final_plan:
-                verification["verdict"] = "empty_plan"
-                verification["summary"] = "⚠️ 最终乘车方案为空（模型未输出 final_plan 或输出无解）"
+                # 空方案按测试记录的 plan_status 细分：模型明确输出空数组（无解）≠ 没输出 JSON
+                if plan_status == "empty_plan":
+                    verification["verdict"] = "empty_plan"
+                    verification["summary"] = "⚠️ 模型明确输出无解（final_plan 为空数组）"
+                else:
+                    verification["verdict"] = "no_plan"
+                    verification["summary"] = ("⚠️ 模型未输出 final_plan JSON"
+                                               "（对话轮数用尽/输出格式错误）")
             verdict = verification.get("verdict", "unknown")
             verdict_count[verdict] = verdict_count.get(verdict, 0) + 1
 
             tu = data.get("token_usage") or {}
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            result_name = f"{ts}_{data.get('model_name', 'unknown')}_{qid}.json"
+            # 模型名可能带 / 或 :（OpenRouter/Ollama 风格），直接拼文件名会 FileNotFoundError/非法路径
+            safe_model = re.sub(r'[\\/:*?"<>|]', "_",
+                                data.get("model_name", "unknown") or "unknown")
+            result_name = f"{ts}_{safe_model}_{qid}.json"
             record = {
                 "timestamp": datetime.now().isoformat(),
                 "test_file": fn,
                 "question_id": qid,
+                "plan_status": plan_status,
                 "model_name": data.get("model_name", "unknown"),
                 "user_input": data.get("user_input", ""),
                 "score_summary": {
@@ -133,6 +150,15 @@ def run_eval(logs_test: str, logs_result: str, ids: list, re_evaluate: bool):
             }
             with open(os.path.join(logs_result, result_name), "w", encoding="utf-8") as fh:
                 json.dump(record, fh, ensure_ascii=False, indent=2)
+
+            # 重测场景：删除该测试记录的旧结果文件（防 aggregate 重复计数）
+            olds = [o for o in done.get(fn, []) if o and o != result_name]
+            for old in olds:
+                old_path = os.path.join(logs_result, old)
+                if os.path.exists(old_path):
+                    os.remove(old_path)
+            if olds:
+                print(f"  🗑 已删除 {fn} 的 {len(olds)} 份旧测评结果")
 
             model_name = data.get("model_name", "unknown")
             if qid != "unknown" and model_name:

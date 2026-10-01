@@ -254,6 +254,11 @@ def write_legal_solution(q_conn, rw, question_type: str, train_num: str, stops: 
         sols = find_transfer_solutions(rw, train_num,
                                        [(ids[i], stops[i]["stop_time"]) for i in mids],
                                        actual_dest)
+        # 与 mixed 同规则：换乘车一律排除经过出发站 A 的车，
+        # 保证「换乘车不经过 A」全局不变量（杜绝"只坐 U 从 A 直达 B"类逃逸）
+        sols = [s for s in sols
+                if not any(st["station_id"] == ids[from_idx]
+                           for st in db.get_train_stops(rw, s["train_num"]))]
         if not sols:
             raise RetryTrainError(f"未找到合适的换乘车次到 {actual_dest}（已枚举全部中间站）")
         chosen = rng.choice(sols)
@@ -285,6 +290,11 @@ def write_legal_solution(q_conn, rw, question_type: str, train_num: str, stops: 
             seg_from, seg_to = path[si], path[si + 1]
             if si > 0:
                 cands = _find_transfer_trains(rw, train_num, seg_from, seg_to, arrival_at_seg_start)
+                # 一律排除经过出发站 A 的换乘车：否则「只坐 U 从 A 直达 B」成为第二合法解，
+                # 破坏存在性题唯一解前提（模型给出合法解反被标答比对误判）
+                cands = [c for c in cands
+                         if not any(s["station_id"] == ids[from_idx]
+                                    for s in db.get_train_stops(rw, c["train_num"]))]
                 if strategy == "short_buy" and si < transfers:
                     # 非末段买短补长：排除经过最终站 B 的车（防跳过后续换乘直达终点）
                     cands = [c for c in cands
@@ -633,7 +643,8 @@ def generate_question(params: GenerateParams, prefix: str, mode: str,
                 seat_type=params.seat_type,
                 start_station_id=from_id,
                 end_station_id=to_id,
-                criterion=params.criterion if mode == "selective" else "comprehensive",
+                # 存在性题不写评判标准：题面不应带「综合考虑」（诱导模型偏离唯一解），仅选择性题有
+                criterion=params.criterion if mode == "selective" else "",
                 ground_truth=segments,
                 interference_density=density if interference_mode != "none" else None,
                 constraints=constraints or None,
@@ -643,7 +654,7 @@ def generate_question(params: GenerateParams, prefix: str, mode: str,
                 "question_type": params.question_type,
                 "target_train_num": target_train,
                 "solution_segments": segments,
-                "criterion": params.criterion if mode == "selective" else "comprehensive",
+                "criterion": params.criterion if mode == "selective" else "",
                 "constraints": constraints,
             }
 
@@ -677,15 +688,29 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
     seq = 0
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    def generate_one(qtype, transfers, plans, criterion, constraints_, prefix, imode, density):
-        """重试 ≤ max_retries，每次重随机站对/方向/人数/座位。成功返回 (qid, 尝试数, None, 首次序号)，
-        失败返回 (None, max_retries, 错误, 首次序号)。"""
+    def generate_one(qtype, transfers, plans, criterion, constraints_, prefix, imode, density,
+                     custom_qid_base: str = None, reuse: dict = None):
+        """重试 ≤ max_retries，每次重随机站对/方向/人数/座位。
+        成功返回 (qid, 尝试数, None, 首次序号, 随机参数)，失败返回 (None, max_retries, 错误, 首次序号, None)。
+        custom_qid_base：配对题复用的基础号（同 row 的 0_ 复用 1_ 的），否则按 seq 递增生成。
+        reuse：配对题复用的随机参数（站对/方向/人数/座位）——0_ 与 1_ 题面一致才能被
+        step3 按「基础题号+内容」配对共享文案（对比实验前提）；不传则独立随机。"""
         nonlocal seq
         last_err = ""
         first_seq = None
         for attempt in range(1, max_retries + 1):
-            pair = random.choice(stations)
-            a, b = (pair[0], pair[1]) if random.random() < 0.5 else (pair[1], pair[0])
+            if reuse:
+                pair, a, b = reuse["pair"], reuse["a"], reuse["b"]
+                people = reuse["people"]
+                seat = reuse["seat"]
+            else:
+                pair = random.choice(stations)
+                a, b = (pair[0], pair[1]) if random.random() < 0.5 else (pair[1], pair[0])
+                people = random.randint(3, 6)
+                seat = random.choices(
+                    ["class0", "class1", "class2"],
+                    weights=[seat_weights.get("class0", 0), seat_weights.get("class1", 0),
+                             seat_weights.get("class2", 0)])[0]
             seq += 1
             if first_seq is None:
                 first_seq = seq   # 首次尝试的序号（失败回执/日志用它，对齐参考 first_sq）
@@ -695,12 +720,9 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
                 to_station_id=b,
                 transfers=transfers,
                 segment_plans=plans,
-                custom_qid=f"B{timestamp}_{seq:04d}",
-                people_count=random.randint(3, 6),
-                seat_type=random.choices(
-                    ["class0", "class1", "class2"],
-                    weights=[seat_weights.get("class0", 0), seat_weights.get("class1", 0),
-                             seat_weights.get("class2", 0)])[0],
+                custom_qid=custom_qid_base or f"B{timestamp}_{seq:04d}",
+                people_count=people,
+                seat_type=seat,
                 criterion=criterion,
                 constraints=constraints_,
             )
@@ -708,23 +730,34 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
                 qid, _ = generate_question(params, prefix,
                                            "existence" if prefix != "2_" else "selective",
                                            imode, density, rng=random.Random())
-                return qid, attempt, None, first_seq
+                used = None if reuse else {"pair": pair, "a": a, "b": b,
+                                           "people": people, "seat": seat}
+                return qid, attempt, None, first_seq, used
             except (GenerateError, db.PathsNotConfigured) as e:
                 last_err = str(e)
             except Exception as e:
                 last_err = str(e)
-        return None, max_retries, last_err, first_seq
+        return None, max_retries, last_err, first_seq, None
 
-    # ---- 存在性：1_ 干扰 / 0_ 无注入 ----
+    # ---- 存在性：1_ 干扰 / 0_ 无注入（同 row 共享基础号与随机参数 → 题面一致，
+    #      step3 按「基础题号+内容」配对共享文案，对比实验前提） ----
     for idx, row in enumerate(distribution):
         label = f"{row.get('category', '')}/{row.get('name', '')}"
+        ones_base = None   # 同 row 1_ 成功后的基础号（B..._NNNN），最近的 0_ 复用以配对
+        ones_rand = None   # 同 row 1_ 成功那次的随机参数（站对/方向/人数/座位）
         for key, prefix, imode, tag in (("has_interference", "1_", "interference", "干扰"),
                                         ("no_interference", "0_", "none", "无干扰")):
             for _ in range(int(row.get(key) or 0)):
-                qid, tries, err, sq = generate_one(
+                pair_base = reuse = None
+                if prefix == "0_" and ones_base:
+                    # 用掉即焚：基础号防重号冲突，随机参数保证 0_/1_ 题面一致
+                    pair_base, ones_base = ones_base, None
+                    reuse, ones_rand = ones_rand, None
+                qid, tries, err, sq, rand_used = generate_one(
                     row["question_type"], int(row.get("transfers") or 0),
                     row.get("segment_plans") or [], "comprehensive",
-                    [], prefix, imode, interference_density)
+                    [], prefix, imode, interference_density,
+                    custom_qid_base=pair_base, reuse=reuse)
                 details.append({"question_id": qid or f"{prefix}B{timestamp}_{sq:04d}",
                                 "row": f"{label}/{tag}", "attempts": tries,
                                 "ok": qid is not None, "error": err})
@@ -732,6 +765,9 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
                     exists_fail[idx][key] += 1
                     log(f"[{sq:04d}] {prefix} 存在性（{tag}）{label} 失败（重试 {tries} 次）：{err}", "error")
                 else:
+                    if prefix == "1_":
+                        ones_base = qid[len(prefix):]   # "1_B..._0005" → "B..._0005"
+                        ones_rand = rand_used
                     log(f"[{sq:04d}] {prefix} 存在性（{tag}）{label} → {qid}（尝试 {tries} 次）", "success")
 
     # ---- 选择性：2_ 随机票（题型由行为约束推导） ----
@@ -740,8 +776,8 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
         crit, beh = row.get("criterion", "comprehensive"), row.get("behavior", "none")
         constraints_ = [] if beh == "none" else [beh]
         for _ in range(int(row.get("count") or 0)):
-            qid, tries, err, sq = generate_one(None, 0, [], crit, constraints_,
-                                               "2_", "random_tickets", random_tickets_density)
+            qid, tries, err, sq, _rand = generate_one(None, 0, [], crit, constraints_,
+                                                      "2_", "random_tickets", random_tickets_density)
             details.append({"question_id": qid or f"2_B{timestamp}_{sq:04d}",
                             "row": f"{criterion_cn(crit)}/{behavior_cn(beh)}",
                             "attempts": tries, "ok": qid is not None, "error": err})
@@ -749,7 +785,7 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
                 sel_fail[idx] += 1
                 log(f"[{sq:04d}] 2_ 选择性 {criterion_cn(crit)}({behavior_cn(beh)}) 失败：{err}", "error")
             else:
-                log(f"[{seq:04d}] 2_ 选择性 {criterion_cn(crit)}({behavior_cn(beh)}) → {qid}（尝试 {tries} 次）",
+                log(f"[{sq:04d}] 2_ 选择性 {criterion_cn(crit)}({behavior_cn(beh)}) → {qid}（尝试 {tries} 次）",
                     "success")
 
     ok = sum(1 for d in details if d["ok"])

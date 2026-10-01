@@ -51,7 +51,8 @@
 候选车次 T 要求：经过 A、**不经过 B**（防 T 直达逃逸）、A 之后仍有站。
 **核心一**：一条 SQL 枚举 T 上全部可行 (中间站 M, 换乘车 U)——
 U 经过 M 且 M 在实际目的地 B 之前、U≠T、`T到达M时刻 + 20min ≤ U 从 M 发车`。
-与目的地**同城**（去"东/南/西/北/站"后缀比较）的中间站被过滤。
+**换乘车一律排除经过出发站 A 的车**（与 mixed 同规则，保证「换乘车不经过 A」
+全局不变量）；与目的地**同城**（去"东/南/西/北/站"后缀比较）的中间站被过滤。
 均匀随机挑一个方案；写两段：T 乘 A→M、U 乘 M→B。
 
 ### short_buy 买短补长
@@ -69,7 +70,9 @@ ground_truth 记 `ride_to = B`。
 ### mixed 混合
 路径 A → M1 → … → MN → B（N=换乘数，从中间站随机采样）。
 段 0 用 T（记录 T 到达 M1 的时刻作为衔接基准）；段 i>0 在 M(i) 找换乘车
-（复用核心一）：非末段的 short_buy 策略**排除经过最终站 B 的车**（防跳过后续
+（复用核心一）：换乘车**一律排除经过出发站 A 的车**——否则「只坐换乘车从 A
+直达 B」成为第二合法解，破坏存在性题唯一解前提（模型给出合法解反被标答比对
+误判）；非末段的 short_buy 策略额外**排除经过最终站 B 的车**（防跳过后续
 换乘直达终点）；后续还有换乘时选中车必须在本段终点有合法 HH:MM 到达时刻。
 然后在每段车上按段策略（direct/short_buy/extra_front/extra_rear）落票。
 
@@ -115,7 +118,7 @@ ground_truth 记 `ride_to = B`。
 | interference_density | 0.02 | 注入密度（仅注入题存） |
 | people_count / seat_type | 3 / class1 | 需求人数、标答席别 |
 | start_station_id / end_station_id | VNP / AOH | 出发/到达电报码 |
-| criterion | fastest | 评判标准（仅选择性；存在性恒 comprehensive） |
+| criterion | fastest | 评判标准（仅选择性题写值；存在性写空——题面不带「综合考虑」，防诱导模型偏离唯一解） |
 | constraints | ["no_transfer"] | 行为约束（仅选择性；no_transfer 与 no_short_buy_extra 互斥） |
 | ground_truth | [{train_num, from_station_id, to_station_id, ride_from_station_id, ride_to_station_id, tickets, seat_type, seg_type, …}] | 结构化标答（含站名冗余字段），verifier 存在性对标用 |
 | trains / train_count | ["G1","G102"] | 标答涉及车次（合并去重） |

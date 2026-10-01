@@ -113,7 +113,7 @@ python step5_eval.py report --logs-result logs\result --logs-test logs\test ^
 | `--train G1` | — | 仅爬指定车次 |
 | `--workers N` | — | 并发线程数，默认 1，建议 3~5；每线程独立 Session 并同步主 Cookie |
 
-**cleanup** —— 一键清理：同车多号去重 → 非相邻段补算 → 删仍不全车次（零票价记录保护）→ 重建 station_trains
+**cleanup** —— 一键清理：同车多号去重 → 非相邻段补算 → 删仍不全车次 → 重建 station_trains
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
@@ -178,7 +178,8 @@ python step5_eval.py report --logs-result logs\result --logs-test logs\test ^
 | `--prices-db` | 必填 | 票价数据库（只读；query_ticket_price 工具） |
 | `--question-dir` | 必填 | 题目目录（query_tickets 工具读当前题 `{qid}.db`） |
 | `--metadata` | 必填 | 元数据（读题面/nl_question 与 state 去重；测试成功写回 state=tested） |
-| `--logs-test` | 必填 | 测试记录输出目录（`{时间戳}_{model}_{qid}.json`） |
+| `--metadata-nl` | — | NL 元数据路径（默认从 question-dir 推导 metadata_nl.json） |
+| `--logs-test` | 必填 | 测试记录输出目录（`{时间戳}_{model}_{qid}.json`；模型名中 `/`、`:` 等非法字符替换为 `_`） |
 | `--model` | — | 被测模型名；未填读 .env `TEST_MODEL` → `DEFAULT_MODEL` |
 | `--api-key` | — | 未填读 .env `TEST_API_KEY` |
 | `--base-url` | — | 未填读 .env `TEST_BASE_URL` → `DEFAULT_BASE_URL` |
@@ -208,7 +209,7 @@ python step5_eval.py report --logs-result logs\result --logs-test logs\test ^
 | `--logs-test` | 必填 | 测试记录目录（输入） |
 | `--logs-result` | 必填 | 测评结果目录（输出） |
 | `--ids f1.json f2.json` | — | 仅测评指定记录文件名 |
-| `--re-evaluate` | — | 已测评的记录也重新测评（默认跳过已测评） |
+| `--re-evaluate` | — | 已测评的记录也重新测评（默认跳过）；重测成功后自动删除该记录的旧结果，不重复计数 |
 
 **stats** —— 按模型聚合统计
 
@@ -236,13 +237,19 @@ API 配置优先级：命令行显式参数 > `.env`（`TEST_*`/`NL_*` → `DEFA
 - **state 流水线**：`metadata[qid]["state"] = ["模型:tested", "模型:evaluated", ...]`，
   只记成功；成功后同模型不可重测（step4/step5 自动去重）。
 - **verdict 五档**：pass / hallucination / no_plan / empty_plan / db_not_found。
+  空方案按测试记录 plan_status 细分：模型明确输出空数组（无解）= empty_plan；
+  未输出 final_plan JSON = no_plan。
+- **判定口径**：存在性题要求与唯一标答完全一致（提交段逐段比对 + 标答段反向
+  覆盖检查，漏段按错）；选择性题要求全程可达 + 票真价对 + 座位等级符合题目要求。
 
 ## 注意事项
 
 1. **不要并行运行 step2 / step3 / step4 / step5 eval**：它们都写 metadata.json
    （进程内有锁，跨进程没有）。step1 与纯读操作（`--list`、`stats`）可并行。
-2. 采集与反爬：12306 有风控，务必遵守默认限速；`prices` 支持 Ctrl+C 优雅退出
-   （按一次等在途请求收尾，再按两次强制退出）。
+2. 采集与反爬：12306 有风控，务必遵守默认限速（限速器已加锁，多线程下全局间隔
+   不被击穿）；`prices` 支持 Ctrl+C 优雅退出（按一次等在途请求收尾，再按两次
+   强制退出）；`all` 流程中 tickets 阶段同样响应中断（当前车次完成后停止，
+   已入库数据保留）。
 3. `metadata.json` 与 `metadata_nl.json` 是两个独立文件：NL 过程只写后者，
    读取侧自动合并。手工编辑时请保持 JSON 结构。
 4. 题目库 `question/{qid}.db` 中 class0/1/2 三表为**稀疏存储**：没有行 = 0 张票。

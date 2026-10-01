@@ -39,7 +39,6 @@ import requests
 from common import config
 from common import database as db
 from common.prompts import SYSTEM_PROMPT
-from verifier import normalize_final_plan
 
 # ============================================================
 # 工具定义（OpenAI Tools；被测模型可见的全部能力）
@@ -185,7 +184,8 @@ def execute_tool(func_name: str, func_args: Dict, question_id: Optional[str]) ->
 
             if func_name == "list_stations":
                 return _paged(rw, "stations", "station_id, station_name", "station_name",
-                              func_args, lambda r: {"station_id": r[0], "station_name": r[1]})
+                              func_args, lambda r: {"station_id": r[0], "station_name": r[1]},
+                              search_cols="station_name, station_id")   # 站名/电报码均可搜
 
             if func_name == "list_trains":
                 return _paged(rw, "trains", "train_num", "train_num",
@@ -242,16 +242,19 @@ def execute_tool(func_name: str, func_args: Dict, question_id: Optional[str]) ->
         return {"error": str(e)}
 
 
-def _paged(rw, table: str, cols: str, order_col: str, args: Dict, fmt) -> List[Dict]:
-    """list_stations / list_trains 共用的关键词 + 分页查询（limit≤200）"""
+def _paged(rw, table: str, cols: str, order_col: str, args: Dict, fmt,
+           search_cols: str = None) -> List[Dict]:
+    """list_stations / list_trains 共用的关键词 + 分页查询（limit≤200）；
+    search_cols：keyword 匹配的列（默认仅排序列，list_stations 传站名+电报码两列）"""
     keyword = args.get("keyword", "")
     limit = max(1, min(int(args.get("limit", 50) or 50), 200))
     offset = (max(1, int(args.get("page", 1) or 1)) - 1) * limit
     sql = f"SELECT {cols} FROM {table}"
     params: list = []
     if keyword:
-        sql += f" WHERE {order_col} LIKE ?"
-        params.append(f"%{keyword}%")
+        sc = [c.strip() for c in (search_cols or order_col).split(",")]
+        sql += " WHERE " + " OR ".join(f"{c} LIKE ?" for c in sc)
+        params += [f"%{keyword}%"] * len(sc)
     sql += f" ORDER BY {order_col} LIMIT ? OFFSET ?"
     params += [limit, offset]
     return [fmt(r) for r in rw.execute(sql, params).fetchall()]
@@ -442,8 +445,9 @@ def parse_ai_final_plan(content: str) -> Optional[List[Dict]]:
         plan = data["final_plan"]
         if len(plan) == 0:
             return []   # 模型明确输出无解
-        valid = [e for e in normalize_final_plan(plan) if not e.get("__invalid__")]
-        return valid if valid else []
+        # 原样返回（含格式非法条目）：丢弃会让 verifier 的 invalid_plan_item 永远触发不了，
+        # 全非法时被误记成 empty_plan（模型明明输出了方案，只是格式不对）
+        return plan
     except (json.JSONDecodeError, ValueError, TypeError):
         return None
 
@@ -477,7 +481,9 @@ def save_test_record(result: Dict, question_id: str, model_name: str,
         "trace": trace,
     }
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"{ts}_{model_name}_{question_id}.json"
+    # 模型名可能带 / 或 :（OpenRouter/Ollama 风格），直接拼文件名会 FileNotFoundError/非法路径
+    safe_model = re.sub(r'[\\/:*?"<>|]', "_", model_name or "unknown")
+    filename = f"{ts}_{safe_model}_{question_id}.json"
     os.makedirs(logs_dir, exist_ok=True)
     path = os.path.join(logs_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
@@ -563,6 +569,8 @@ def main():
     ap.add_argument("--prices-db", required=True, help="票价数据库路径（只读）")
     ap.add_argument("--question-dir", required=True, help="题目目录（{qid}.db）")
     ap.add_argument("--metadata", required=True, help="题目元数据路径")
+    ap.add_argument("--metadata-nl", default=None,
+                    help="NL 元数据路径（默认从 question_dir 推导 metadata_nl.json）")
     ap.add_argument("--logs-test", required=True, help="测试记录输出目录")
     ap.add_argument("--model", default="", help="被测模型名（未填读 .env TEST_MODEL→DEFAULT_MODEL）")
     ap.add_argument("--api-key", default="", help="API Key（未填读 .env TEST_API_KEY）")
@@ -581,7 +589,8 @@ def main():
     llm = {"model": model, "api_key": api_key, "base_url": base_url}
 
     db.configure_paths(railway_db=args.railway_db, prices_db=args.prices_db,
-                       question_dir=args.question_dir, metadata=args.metadata)
+                       question_dir=args.question_dir, metadata=args.metadata,
+                       metadata_nl=args.metadata_nl)
     metadata = db.load_metadata()
 
     all_qids = [q for q, m in metadata.items()

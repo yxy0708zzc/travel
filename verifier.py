@@ -180,7 +180,21 @@ def verify_final_plan(final_plan: List[Dict], question_id: str) -> Dict[str, Any
             _verify_tickets_and_price(item, conn, p_conn, name_map, agg_claims,
                                       results, issues, price_missing_issues)
 
-        # ---- 层2a：存在性 = 与标答完全一致（四维细分） ----
+        # ---- 层2a：存在性 = 与标答完全一致（提交段比对 + 标答段反向覆盖） ----
+        if not selective and gt_purchase:
+            submitted_keys = {_seg_key(i) for i in purchase_items}
+            for g in gt_purchase:
+                if _seg_key(g) not in submitted_keys:
+                    issues.append({
+                        "type": "missing_gt_segment",
+                        "train_num": g.get("train_num", ""),
+                        "from_station_id": g.get("from_station_id", ""),
+                        "to_station_id": g.get("to_station_id", ""),
+                        "detail": (f"标准答案包含 {g.get('train_num', '')} "
+                                   f"{g.get('from_station_id', '')}→{g.get('to_station_id', '')} "
+                                   f"{g.get('seat_type', '')} 段，方案未提交"
+                                   "（存在性题要求与唯一标答完全一致，漏段按错处理）"),
+                    })
         for item in purchase_items:
             if item["tickets"] < people_count:
                 issues.append({
@@ -196,7 +210,22 @@ def verify_final_plan(final_plan: List[Dict], question_id: str) -> Dict[str, Any
                 continue
             issues.extend(_gt_mismatch_issues(item, gt_purchase))
 
-        # ---- 层2b：选择性 = 全程可达 ----
+        # ---- 层2b：选择性 = 全程可达 + 座位等级符合题目要求 ----
+        if selective:
+            req_seat = str(meta.get("seat_type") or "")
+            if req_seat:
+                for item in purchase_items:
+                    if str(item.get("seat_type", "")) != req_seat:
+                        issues.append({
+                            "type": "seat_mismatch",
+                            "train_num": item["train_num"],
+                            "from_station_id": item["from_station_id"],
+                            "to_station_id": item["to_station_id"],
+                            "seat_type": item["seat_type"],
+                            "detail": (f"题目要求{_SEAT_CN.get(req_seat, req_seat)}，"
+                                       f"但 {item['train_num']} 实际购买"
+                                       f"{_SEAT_CN.get(str(item.get('seat_type', '')), str(item.get('seat_type', '')))}"),
+                        })
         if selective and (start_id or end_id):
             issues.extend(check_reachability(valid_items, start_id, end_id))
 
@@ -344,15 +373,20 @@ def _result_item(item: Dict, name_map: Dict, actual, match: bool,
     return out
 
 
+_SEAT_CN = {"class0": "特等座", "class1": "一等座", "class2": "二等座"}
+
+
+def _seg_key(s: Dict) -> tuple:
+    """方案段唯一键（车次/购买区间/座位/乘坐区间）：提交段与标答段比对共用"""
+    return (str(s.get("train_num", "")), str(s.get("from_station_id", "")),
+            str(s.get("to_station_id", "")), str(s.get("seat_type", "")),
+            str(s.get("ride_from_station_id") or s.get("from_station_id", "")),
+            str(s.get("ride_to_station_id") or s.get("to_station_id", "")))
+
+
 def _gt_mismatch_issues(item: Dict, gt_purchase: List[Dict]) -> List[Dict]:
     """存在性题层2：与标答不一致时细分四维（车次/购买区间/座位/乘坐区间）"""
-    def seg_key(s: Dict) -> tuple:
-        return (str(s.get("train_num", "")), str(s.get("from_station_id", "")),
-                str(s.get("to_station_id", "")), str(s.get("seat_type", "")),
-                str(s.get("ride_from_station_id") or s.get("from_station_id", "")),
-                str(s.get("ride_to_station_id") or s.get("to_station_id", "")))
-
-    if seg_key(item) in {seg_key(g) for g in gt_purchase}:
+    if _seg_key(item) in {_seg_key(g) for g in gt_purchase}:
         return []
 
     gt_trains = {str(g.get("train_num", "")) for g in gt_purchase}
@@ -449,6 +483,7 @@ def check_reachability(plan_items: List[Dict], start_id: str,
                                "train_num": item.get("train_num", ""),
                                "detail": (f"第{i + 1}段缺少实际乘坐区间 ride_from/ride_to"
                                           "（按不全处理）")})
+                broken = True   # 缺 ride 段衔接无法验证，避免下一段连带误报“不连续”
                 continue
             tn = str(item.get("train_num", ""))
             f = str(item.get("ride_from_station_id") or item.get("from_station_id", ""))

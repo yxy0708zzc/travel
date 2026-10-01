@@ -141,6 +141,9 @@ def parse_stations_xlsx(data: bytes) -> List[List[str]]:
             continue
         a = str(r[0]).strip() if r[0] is not None else ""
         b = str(r[1]).strip() if len(r) > 1 and r[1] is not None else ""
+        # 跳过表头（「出发站/到达站」两格或合并单格），否则会被当成一对站白费一次出题尝试
+        if "出发站" in a and "到达站" in (a + b):
+            continue
         if a and b and a != b:
             stations.append([a, b])
     return stations
