@@ -413,9 +413,8 @@ def main():
         p.add_argument("--railway-db", required=True, help="基础数据库路径（核查经停/站名用，只读）")
         p.add_argument("--prices-db", required=True, help="票价数据库路径（票价核查用，只读）")
         p.add_argument("--question-dir", required=True, help="题目目录（核查读 {qid}.db）")
-        p.add_argument("--metadata", default=None,
-                       help="题目元数据路径（默认 {question-dir}/metadata.json）")
-        p.add_argument("--metadata-nl", default=None, help="NL 产物路径（可选）")
+        p.add_argument("--metadata-nl", required=True,
+                       help="元数据事实源（metadata_nl.json；含标答快照/题面/state）")
         p.add_argument("--env", default=None, help=".env 路径（默认脚本目录）")
 
     p_eval = sub.add_parser("eval", help="批量测评：测试记录 → 代码核查 → 结果落盘")
@@ -442,8 +441,7 @@ def main():
         from common import config
         config.ENV.update(config.load_env(args.env))
     db.configure_paths(railway_db=args.railway_db, prices_db=args.prices_db,
-                       question_dir=args.question_dir,
-                       metadata=args.metadata, metadata_nl=args.metadata_nl)
+                       question_dir=args.question_dir, metadata_nl=args.metadata_nl)
 
     if args.cmd == "eval":
         run_eval(args.logs_test, args.logs_result, args.ids, args.re_evaluate)

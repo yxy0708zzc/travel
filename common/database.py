@@ -36,8 +36,10 @@ def configure_paths(railway_db: str = None, prices_db: str = None,
                     question_dir: str = None, metadata: str = None,
                     metadata_nl: str = None, data_dir: str = None):
     """注入数据流路径（None=保持已设值）。缺省推导：
-    data_dir ← railway_db 所在目录；metadata ← question_dir/metadata.json；
-    metadata_nl ← question_dir/metadata_nl.json。"""
+    data_dir ← railway_db 所在目录；metadata ← question_dir/metadata.json
+    （step2/3 出题与 NL 生成用，step3 后归档只读）；
+    metadata_nl ← question_dir/metadata_nl.json（step3 之后唯一元数据事实源，
+    step4/5 的 --metadata-nl 指向它）。"""
     if railway_db:
         _PATHS["railway_db"] = os.path.abspath(railway_db)
     if prices_db:
@@ -357,7 +359,10 @@ def get_train_tickets_filtered(conn: sqlite3.Connection, train_num: str,
 
 
 # ============================================================
-# 题目元数据（metadata.json + metadata_nl.json）
+# 题目元数据（线性数据流）：
+#   metadata.json      = step2 出题产物（step2/3 使用，step3 后归档只读）
+#   metadata_nl.json   = step3 之后唯一元数据事实源（标答快照+题面+state），
+#                        step4/5 只读写它
 # 全部读写经进程级可重入锁串行化，配合"锁内读-改-写"，杜绝并发丢更新；
 # 落盘一律 tmp + os.replace 原子写、utf-8-sig 读（兼容 BOM）。
 # ============================================================
@@ -366,25 +371,11 @@ _METADATA_LOCK = threading.RLock()
 
 
 def load_metadata() -> Dict:
-    """读主元数据并自动合并 metadata_nl.json 的 nl_question 字段
-    （仅当 qid 仍存在于主文件时生效，删除题目后 NL 残留无副作用）。"""
+    """读元数据事实源 = metadata_nl.json（step3 之后唯一元数据：条目含
+    【主元数据快照 + nl_question + state】）。metadata.json 仅 step2/3 使用，
+    step3 结束后归档只读。"""
     with _METADATA_LOCK:
-        p = _path("metadata")
-        metadata = {}
-        if os.path.exists(p):
-            with open(p, "r", encoding="utf-8-sig") as f:
-                metadata = json.load(f)
-        for qid, entry in _metadata_nl_unlocked().items():
-            nlq = (entry or {}).get("nl_question") if isinstance(entry, dict) else None
-            if nlq and isinstance(metadata.get(qid), dict):
-                metadata[qid]["nl_question"] = nlq
-        return metadata
-
-
-def save_metadata(metadata: Dict):
-    """整体保存主元数据（锁内原子写）。传入的应是刚 load 的最新快照。"""
-    with _METADATA_LOCK:
-        _save_json_atomic(_path("metadata"), metadata)
+        return _metadata_nl_unlocked()
 
 
 def get_question_metadata(question_id: str) -> Dict:
@@ -424,7 +415,7 @@ def update_question_metadata(question_id: str, **fields):
         _save_json_atomic(p, metadata)
 
 
-# ---- NL 独立产物：NL 过程不触碰主元数据；读取侧由 load_metadata 自动合并 ----
+# ---- NL 独立产物：step3 写入题面；step3 之后本文件即唯一元数据事实源 ----
 
 def _metadata_nl_unlocked() -> Dict:
     p = _PATHS.get("metadata_nl")
@@ -440,7 +431,7 @@ def _metadata_nl_unlocked() -> Dict:
 
 def update_metadata_nl(updates: Dict[str, str]):
     """增量写入 NL 产物：{qid: 文本}。每题存【主元数据条目快照 + nl_question】，
-    已有快照沿用（保留首轮字段）。锁内原子写。"""
+    已有快照沿用（保留首轮字段，含 state——重新生成 NL 不丢测试记忆）。锁内原子写。"""
     if not updates:
         return
     with _METADATA_LOCK:
@@ -461,7 +452,7 @@ def update_metadata_nl(updates: Dict[str, str]):
         _save_json_atomic(_path("metadata_nl"), nl)
 
 
-# ---- 流水线 state：metadata[qid]["state"] = ["<model>:tested|evaluated", ...]
+# ---- 流水线 state：metadata_nl[qid]["state"] = ["<model>:tested|evaluated", ...]
 #      只记成功（失败可重试）；成功后同模型不可重测（去重依据） ----
 
 def get_question_model_state(entry: Dict, model: str) -> Optional[str]:
@@ -473,30 +464,22 @@ def get_question_model_state(entry: Dict, model: str) -> Optional[str]:
     return None
 
 
-def get_question_tested_models(entry: Dict) -> List[str]:
-    out = set()
-    for s in (entry.get("state") or []):
-        if isinstance(s, str) and ":" in s:
-            out.add(s.rsplit(":", 1)[0])
-    return sorted(out)
-
-
 def set_question_model_state(question_id: str, model: str, state: str):
-    """锁内读-改-写设置某模型状态项（幂等）"""
+    """锁内读-改-写设置某模型状态项（幂等）。state 写 metadata_nl.json 条目
+    （step3 之后唯一元数据事实源）；条目不存在（未生成 NL）则忽略。"""
     with _METADATA_LOCK:
-        p = _path("metadata")
-        metadata = {}
-        if os.path.exists(p):
-            with open(p, "r", encoding="utf-8-sig") as f:
-                metadata = json.load(f)
-        entry = metadata.get(question_id)
+        p = _PATHS.get("metadata_nl")
+        if not p:
+            return
+        nl = _metadata_nl_unlocked()
+        entry = nl.get(question_id)
         if not isinstance(entry, dict):
             return
         states = [s for s in (entry.get("state") or [])
-                  if not (isinstance(s, str) and s.rsplit(":", 1)[0] == model)]
+                  if not (isinstance(s, str) and s.rpartition(":")[0] == model)]
         states.append(f"{model}:{state}")
         entry["state"] = states
-        _save_json_atomic(p, metadata)
+        _save_json_atomic(p, nl)
 
 
 def _save_json_atomic(path: str, data):

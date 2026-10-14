@@ -12,11 +12,11 @@
                         │
                         ▼ (step2 读)
         1.xlsx 分布表 + 2.xlsx 站对表 ──step2──▶ question/*.db + metadata.json
-                        │
-                        ▼ (step3 读 metadata)
-                 step3 并发调 LLM ──▶ metadata_nl.json（自然语言题面）
-                        │
-                        ▼ (step4 读题面，运行时查三个库)
+                        │                       （出题产物，step3 后归档只读）
+                        ▼ (step3 读)
+                 step3 并发调 LLM ──▶ metadata_nl.json（题面+标答快照+state；
+                        │               step3 之后唯一元数据事实源）
+                        ▼ (step4 读事实源，运行时查三个库)
         被测模型 ◀─工具调用─ step4 对话循环 ──▶ logs/test/*.json（轨迹+统计）
                         │
                         ▼ (step5 eval)
@@ -77,7 +77,7 @@ python step3_nl.py --metadata question\metadata.json --metadata-nl question\meta
 
 rem ④ 测试被测模型
 python step4_test.py --railway-db data\railway.db --prices-db data\prices.db ^
-    --question-dir question --metadata question\metadata.json --logs-test logs\test ^
+    --question-dir question --metadata-nl question\metadata_nl.json --logs-test logs\test ^
     --max-iterations 30 --concurrency 3 --list   & rem 先扫描
 python step4_test.py ... --concurrency 3            & rem 确认后执行
 
@@ -177,15 +177,14 @@ python step5_eval.py report --logs-result logs\result --logs-test logs\test ^
 | `--railway-db` | 必填 | 基础数据库（只读；5 个查询工具的数据源） |
 | `--prices-db` | 必填 | 票价数据库（只读；query_ticket_price 工具） |
 | `--question-dir` | 必填 | 题目目录（query_tickets 工具读当前题 `{qid}.db`） |
-| `--metadata` | 必填 | 元数据（读题面/nl_question 与 state 去重；测试成功写回 state=tested） |
-| `--metadata-nl` | — | NL 元数据路径（默认从 question-dir 推导 metadata_nl.json） |
+| `--metadata-nl` | 必填 | 元数据事实源（metadata_nl.json：题面/标答快照/state；测试成功写回 state=tested） |
 | `--logs-test` | 必填 | 测试记录输出目录（`{时间戳}_{model}_{qid}.json`；模型名中 `/`、`:` 等非法字符替换为 `_`） |
 | `--model` | — | 被测模型名；未填读 .env `TEST_MODEL` → `DEFAULT_MODEL` |
 | `--api-key` | — | 未填读 .env `TEST_API_KEY` |
 | `--base-url` | — | 未填读 .env `TEST_BASE_URL` → `DEFAULT_BASE_URL` |
 | `--ids q1 q2 ...` | — | 仅测指定题目（默认全部可测题目）；可测 = 有题面+nl 且该模型未测过 |
 | `--max-iterations` | 默认 30 | 最大对话轮数（每轮 = 一次模型 API 请求，轮内可并行多工具），1~100 |
-| `--concurrency` | 默认 1 | 并发数 1~8（每题独立会话，题目上下文按调用传递不串题） |
+| `--concurrency` | 默认 1 | 并发数 1~8（每题独立会话，题目上下文按调用传递不串题）；支持 **Ctrl+C 优雅停止**：在跑的题测完并落盘，未开始的不启动；重跑同命令自动续测（已测过的题被 state 去重跳过） |
 | `--list` | — | 只打印可测清单（题号/类型/可测性/原因），不执行测试 |
 | `--env` | — | .env 路径 |
 
@@ -198,8 +197,7 @@ python step5_eval.py report --logs-result logs\result --logs-test logs\test ^
 | `--railway-db` | 必填 | 基础数据库（只读；核查经停顺序/站名映射） |
 | `--prices-db` | 必填 | 票价数据库（只读；price_wrong / price_missing 核查） |
 | `--question-dir` | 必填 | 题目目录（核查读 `{qid}.db` 余票、metadata 读标答） |
-| `--metadata` | 默认 `{question-dir}/metadata.json` | 元数据路径覆盖 |
-| `--metadata-nl` | — | NL 产物路径（可选，读侧自动合并） |
+| `--metadata-nl` | 必填 | 元数据事实源（metadata_nl.json：标答快照/题面/state） |
 | `--env` | — | .env 路径 |
 
 **eval** —— 批量测评（测试记录 → 代码核查 → 结果落盘 + state=evaluated）
@@ -234,7 +232,7 @@ API 配置优先级：命令行显式参数 > `.env`（`TEST_*`/`NL_*` → `DEFA
 - **012 题型体系**：`0_` 存在性·无注入（唯一解）/ `1_` 存在性·干扰（票数严格<人数，
   唯一解）/ `2_` 选择性·随机票（0.5~1.5×人数，多解）。五题型：换乘 / 买短补长 /
   前额外 / 后额外 / 混合。
-- **state 流水线**：`metadata[qid]["state"] = ["模型:tested", "模型:evaluated", ...]`，
+- **state 流水线**：`metadata_nl.json[qid]["state"] = ["模型:tested", "模型:evaluated", ...]`，
   只记成功；成功后同模型不可重测（step4/step5 自动去重）。
 - **verdict 五档**：pass / hallucination / no_plan / empty_plan / db_not_found。
   空方案按测试记录 plan_status 细分：模型明确输出空数组（无解）= empty_plan；
@@ -244,14 +242,18 @@ API 配置优先级：命令行显式参数 > `.env`（`TEST_*`/`NL_*` → `DEFA
 
 ## 注意事项
 
-1. **不要并行运行 step2 / step3 / step4 / step5 eval**：它们都写 metadata.json
-   （进程内有锁，跨进程没有）。step1 与纯读操作（`--list`、`stats`）可并行。
+1. **不要并行运行 step2 / step3 / step4 / step5 eval**：step2/3 写 metadata.json、
+   step3/4/5 写 metadata_nl.json（进程内有锁，跨进程没有）。step1 与纯读操作
+   （`--list`、`stats`）可并行。
 2. 采集与反爬：12306 有风控，务必遵守默认限速（限速器已加锁，多线程下全局间隔
    不被击穿）；`prices` 支持 Ctrl+C 优雅退出（按一次等在途请求收尾，再按两次
    强制退出）；`all` 流程中 tickets 阶段同样响应中断（当前车次完成后停止，
    已入库数据保留）。
-3. `metadata.json` 与 `metadata_nl.json` 是两个独立文件：NL 过程只写后者，
-   读取侧自动合并。手工编辑时请保持 JSON 结构。
+3. **双文件职责（线性数据流）**：`metadata.json` 是 step2 出题产物，step3 读取后
+   即**归档只读**；`metadata_nl.json` 是 step3 之后的**唯一元数据事实源**（每题 =
+   标答快照 + nl_question + state），step4/5 只读写它。手工操作认准文件：
+   改题面/标答 → 改主文件后重跑 step3（重建快照）；清测试记忆 → 删 `_nl` 中
+   对应条目的 `state` 字段。
 4. 题目库 `question/{qid}.db` 中 class0/1/2 三表为**稀疏存储**：没有行 = 0 张票。
 5. 上传 GitHub：数据目录（data/ question/ logs/）与 .env 已在 .gitignore 中排除；
    templates/ 与 docs/ 应一并提交。

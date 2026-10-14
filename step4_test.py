@@ -25,10 +25,11 @@ import argparse
 import json
 import os
 import re
+import signal
 import sqlite3
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -506,9 +507,26 @@ def testable(metadata: Dict, qid: str, model: str) -> Tuple[bool, str]:
     return True, ""
 
 
+# ============================================================
+# 中断：第一次 Ctrl+C 停止派发新题（在跑的题测完落盘），第二次强制退出
+# ============================================================
+_STOP = False
+
+
+def _shutdown_handler(sig, frame):
+    global _STOP
+    if _STOP:
+        os._exit(130)   # 第二次：立即强退（已完成题目均已即时落盘，不受影响）
+    _STOP = True
+    print("\n🛑 收到中断：在跑的题测完并落盘后停止，不再开始新题；重跑同命令自动续测"
+          "（再按一次 Ctrl+C 强制退出）")
+
+
 def run_batch(llm: Dict[str, str], qids: List[str], max_iterations: int,
               concurrency: int, logs_dir: str) -> List[Dict]:
-    """并发批量测试：每题独立对话 → 落盘 → state=tested（仅成功推进）。"""
+    """并发批量测试：每题独立对话 → 落盘 → state=tested（仅成功推进）。
+    任务动态派发：在跑题数始终 ≤ concurrency；Ctrl+C 后不再派发新题，
+    在跑的题自然测完收尾（一次性全部提交会让线程池退出等待拖住全部待测题）。"""
     model = llm["model"]
     metadata = db.load_metadata()
     todo = []
@@ -550,10 +568,27 @@ def run_batch(llm: Dict[str, str], qids: List[str], max_iterations: int,
             return {"question_id": qid, "ok": False, "error": str(e)}
 
     concurrency = max(1, min(int(concurrency or 1), 8))
+    pending = list(todo)   # 待提交队列（保持原顺序）
+    seq = 0
+    futs = {}
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        for fut in as_completed([pool.submit(one, i, q) for i, q in enumerate(todo, 1)]):
-            with lock:
-                details.append(fut.result())
+        def submit_next():
+            nonlocal seq
+            while pending and not _STOP and len(futs) < concurrency:
+                seq += 1
+                futs[pool.submit(one, seq, pending.pop(0))] = seq
+
+        submit_next()
+        while futs:
+            done, _ = wait(futs, return_when=FIRST_COMPLETED)
+            for fut in done:
+                futs.pop(fut)
+                with lock:
+                    details.append(fut.result())
+            submit_next()
+    if pending:
+        print(f"🛑 已中断：{len(pending)} 题未开始（本次完成 {len(details)} 题均已落盘；"
+              f"重跑同命令自动续测剩余部分）")
     ok = sum(1 for d in details if d["ok"])
     print(f"批量测试完成：成功 {ok} / 失败 {len(details) - ok}")
     return details
@@ -568,9 +603,8 @@ def main():
     ap.add_argument("--railway-db", required=True, help="基础数据库路径（只读）")
     ap.add_argument("--prices-db", required=True, help="票价数据库路径（只读）")
     ap.add_argument("--question-dir", required=True, help="题目目录（{qid}.db）")
-    ap.add_argument("--metadata", required=True, help="题目元数据路径")
-    ap.add_argument("--metadata-nl", default=None,
-                    help="NL 元数据路径（默认从 question_dir 推导 metadata_nl.json）")
+    ap.add_argument("--metadata-nl", required=True,
+                    help="元数据事实源（metadata_nl.json；含题面/标答快照/state）")
     ap.add_argument("--logs-test", required=True, help="测试记录输出目录")
     ap.add_argument("--model", default="", help="被测模型名（未填读 .env TEST_MODEL→DEFAULT_MODEL）")
     ap.add_argument("--api-key", default="", help="API Key（未填读 .env TEST_API_KEY）")
@@ -583,14 +617,15 @@ def main():
     ap.add_argument("--env", default=None, help=".env 路径（默认脚本目录）")
     args = ap.parse_args()
 
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
     if args.env:
         config.ENV.update(config.load_env(args.env))
     model, api_key, base_url = resolve_llm_config(args.model, args.api_key, args.base_url)
     llm = {"model": model, "api_key": api_key, "base_url": base_url}
 
     db.configure_paths(railway_db=args.railway_db, prices_db=args.prices_db,
-                       question_dir=args.question_dir, metadata=args.metadata,
-                       metadata_nl=args.metadata_nl)
+                       question_dir=args.question_dir, metadata_nl=args.metadata_nl)
     metadata = db.load_metadata()
 
     all_qids = [q for q, m in metadata.items()
@@ -614,7 +649,7 @@ def main():
         return
 
     if not qids:
-        print("没有可测试的题目（检查 --metadata 是否含 question/nl_question）")
+        print("没有可测试的题目（检查 --metadata-nl 是否含 question/nl_question）")
         return
     run_batch(llm, qids, max(1, min(args.max_iterations, 100)), args.concurrency,
               args.logs_test)

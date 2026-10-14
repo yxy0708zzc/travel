@@ -7,7 +7,7 @@
 
 ```
 python step4_test.py --railway-db ... --prices-db ... --question-dir ... \
-    --metadata ... [--metadata-nl ...] --logs-test logs/test \
+    --metadata-nl question/metadata_nl.json --logs-test logs/test \
     [--model M] [--api-key K] [--base-url U] [--ids q1 q2] [--list] \
     [--max-iterations 30] [--concurrency 3] [--env .env]
 ```
@@ -16,7 +16,8 @@ python step4_test.py --railway-db ... --prices-db ... --question-dir ... \
   TEST_BASE_URL→DEFAULT_BASE_URL）；缺失报错退出。
 - `--list`：只打印可测清单（题号/类型/可测性/原因），不执行测试。
 - 可测 = 有 `question` 与 `nl_question`、题目库文件存在、且该模型在 state 中
-  无记录（未测过）。测试成功的题同模型不可重测（去重）。
+  无记录（未测过；state 读自 --metadata-nl 指向的事实源）。测试成功的题同模型
+  不可重测（去重）。
 
 ## 2. 工具集（被测模型的全部能力，OpenAI Tools 格式）
 
@@ -108,7 +109,10 @@ messages = [SYSTEM_PROMPT, user=nl_question]
 
 - 先 `--list` 核对待测集合，再正式运行；`--concurrency` 1~8
   （模型限流严的用 1~3）。
+- 中途想停按一次 **Ctrl+C**：在跑的题（≤并发数）测完并落盘，未开始的不启动；
+  已成功的题 state=tested 即时写入，重跑同命令自动续测剩余部分。
+  再按一次强制退出（已完成的不受影响）。
 - 失败（error/超时）不推进 state，可直接重跑同题；
   成功后重测同模型会被跳过——需要重测时手工删除
-  metadata 中对应 `state` 项与 logs/test 记录。
+  metadata_nl.json 中对应条目的 `state` 项与 logs/test 记录。
 - 正式跑之前用 1~2 题小样本验证 API 配置、超时与题面格式。

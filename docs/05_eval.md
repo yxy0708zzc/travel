@@ -8,7 +8,7 @@
 
 | 子命令 | 输入 | 输出 | 功能 |
 |---|---|---|---|
-| `eval` | logs/test | logs/result + metadata state | 逐条核查测试记录并保存结果 |
+| `eval` | logs/test | logs/result + metadata_nl state | 逐条核查测试记录并保存结果 |
 | `stats` | logs/result (+logs/test) | 控制台表 | 按模型聚合 verdict/通过率/双调用/问题码 |
 | `report` | logs/result (+logs/test) | logs/report/*.json,*.md | 排名 + 题型难度 + 洞察，JSON 只留最近 50 份 |
 
@@ -21,7 +21,7 @@ eval 语义：
 - 结果文件结构：`{timestamp, test_file, question_id, model_name, user_input,
   score_summary{hallucination_count, issue_count, total_tokens, duration_seconds},
   verification, human_confirmed:false, human_notes, status}`；文件名含微秒。
-- 成功后 `state: 该题该模型 → evaluated`。
+- 成功后 `state: 该题该模型 → evaluated`（写入 --metadata-nl 指向的事实源）。
 
 ## 2. 核查流程（verify_final_plan）
 
@@ -109,7 +109,7 @@ eval 语义：
   avg_tool_calls**（读关联测试记录：双调用计数优先显式字段，旧记录由 trace
   推导兜底——assistant 轮数与各轮嵌套 tools 总和）；问题码分布。
 - report 排名按 pass_rate 降序；题型维度两组：`by_type`（存在性/选择性）、
-  `by_question_type`（五题型，读 metadata 合并视图）；error_rate>10% 出警告；
+  `by_question_type`（五题型，读 metadata_nl 事实源）；error_rate>10% 出警告；
   自动洞察（最高/最低通过率、题型从易到难排序）。
 - 导出 `summary_{ts}.json`（保留最近 50 份）与 `summary_{ts}.md`。
 

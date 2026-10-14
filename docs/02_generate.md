@@ -123,7 +123,6 @@ ground_truth 记 `ride_to = B`。
 | ground_truth | [{train_num, from_station_id, to_station_id, ride_from_station_id, ride_to_station_id, tickets, seat_type, seg_type, …}] | 结构化标答（含站名冗余字段），verifier 存在性对标用 |
 | trains / train_count | ["G1","G102"] | 标答涉及车次（合并去重） |
 | source | auto | 出题来源 |
-| state | [] | 流水线 state（step4/5 推进） |
 
 ## 7. 批量执行语义
 
