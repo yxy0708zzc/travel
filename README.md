@@ -83,11 +83,14 @@ python step4_test.py ... --concurrency 3            & rem 确认后执行
 
 rem ⑤ 测评 + 统计 + 报告
 python step5_eval.py eval   --logs-test logs\test --logs-result logs\result ^
-    --question-dir question --railway-db data\railway.db --prices-db data\prices.db
+    --question-dir question --metadata-nl question\metadata_nl.json ^
+    --railway-db data\railway.db --prices-db data\prices.db
 python step5_eval.py stats  --logs-result logs\result --logs-test logs\test ^
-    --question-dir question --railway-db data\railway.db --prices-db data\prices.db
+    --question-dir question --metadata-nl question\metadata_nl.json ^
+    --railway-db data\railway.db --prices-db data\prices.db
 python step5_eval.py report --logs-result logs\result --logs-test logs\test ^
-    --report-dir logs\report --question-dir question --railway-db data\railway.db --prices-db data\prices.db
+    --report-dir logs\report --question-dir question --metadata-nl question\metadata_nl.json ^
+    --railway-db data\railway.db --prices-db data\prices.db
 ```
 
 ## 参数说明（全部参数）
@@ -184,7 +187,7 @@ python step5_eval.py report --logs-result logs\result --logs-test logs\test ^
 | `--base-url` | — | 未填读 .env `TEST_BASE_URL` → `DEFAULT_BASE_URL` |
 | `--ids q1 q2 ...` | — | 仅测指定题目（默认全部可测题目）；可测 = 有题面+nl 且该模型未测过 |
 | `--max-iterations` | 默认 30 | 最大对话轮数（每轮 = 一次模型 API 请求，轮内可并行多工具），1~100 |
-| `--concurrency` | 默认 1 | 并发数 1~8（每题独立会话，题目上下文按调用传递不串题）；支持 **Ctrl+C 优雅停止**：在跑的题测完并落盘，未开始的不启动；重跑同命令自动续测（已测过的题被 state 去重跳过） |
+| `--concurrency` | 默认 1 | 并发数 1~8（每题独立会话，题目上下文按调用传递不串题）。工位制：失败不释放工位，原地等 10s 重试（默认上限 30 次，鉴权/余额类错误不重试），只有测完才补新题；全局请求节流：任意两次 LLM 请求间隔 ≥ 2s（跨工位，防账户限流）；支持 **Ctrl+C 快速停止**：不再派新题，在跑的题当前轮推理结束后放弃（≤1 分钟，不落盘），重跑同命令自动续测 |
 | `--list` | — | 只打印可测清单（题号/类型/可测性/原因），不执行测试 |
 | `--env` | — | .env 路径 |
 
@@ -231,7 +234,8 @@ API 配置优先级：命令行显式参数 > `.env`（`TEST_*`/`NL_*` → `DEFA
 
 - **012 题型体系**：`0_` 存在性·无注入（唯一解）/ `1_` 存在性·干扰（票数严格<人数，
   唯一解）/ `2_` 选择性·随机票（0.5~1.5×人数，多解）。五题型：换乘 / 买短补长 /
-  前额外 / 后额外 / 混合。
+  前额外 / 后额外 / 混合。同 row 的 0_/1_ 为配对题：共享基础题号/题面/标答路线，
+  题库仅差干扰注入。
 - **state 流水线**：`metadata_nl.json[qid]["state"] = ["模型:tested", "模型:evaluated", ...]`，
   只记成功；成功后同模型不可重测（step4/step5 自动去重）。
 - **verdict 五档**：pass / hallucination / no_plan / empty_plan / db_not_found。

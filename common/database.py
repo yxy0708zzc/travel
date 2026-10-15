@@ -370,6 +370,23 @@ def get_train_tickets_filtered(conn: sqlite3.Connection, train_num: str,
 _METADATA_LOCK = threading.RLock()
 
 
+def read_metadata_file(path: str) -> Dict:
+    """显式读取指定元数据 JSON 文件（utf-8-sig 兼容 BOM；缺失/损坏返回 {}）。
+
+    与 load_metadata()（= metadata_nl.json 事实源）不同：本函数按给定路径
+    读文件，供出题期的两个场景使用——step2 题号查重读 metadata.json、
+    step3 目标扫描读 metadata.json（metadata_nl 是 step3 的输出，首跑尚不存在）。
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
 def load_metadata() -> Dict:
     """读元数据事实源 = metadata_nl.json（step3 之后唯一元数据：条目含
     【主元数据快照 + nl_question + state】）。metadata.json 仅 step2/3 使用，

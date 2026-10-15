@@ -120,7 +120,7 @@ ground_truth 记 `ride_to = B`。
 | start_station_id / end_station_id | VNP / AOH | 出发/到达电报码 |
 | criterion | fastest | 评判标准（仅选择性题写值；存在性写空——题面不带「综合考虑」，防诱导模型偏离唯一解） |
 | constraints | ["no_transfer"] | 行为约束（仅选择性；no_transfer 与 no_short_buy_extra 互斥） |
-| ground_truth | [{train_num, from_station_id, to_station_id, ride_from_station_id, ride_to_station_id, tickets, seat_type, seg_type, …}] | 结构化标答（含站名冗余字段），verifier 存在性对标用 |
+| ground_truth | [{train_num, from_station_id, to_station_id, ride_from_station_id, ride_to_station_id, tickets, seat_type, strategy, …}] | 结构化标答（含站名冗余字段），verifier 存在性对标用 |
 | trains / train_count | ["G1","G102"] | 标答涉及车次（合并去重） |
 | source | auto | 出题来源 |
 
@@ -129,6 +129,10 @@ ground_truth 记 `ride_to = B`。
 - 顺序：先全部存在性（按分布行，先 1_ 有干扰再 0_ 无干扰），后全部选择性。
 - 每题 `generate_one`：重试 ≤ max_retries，**每次重试重新随机** 站对/方向/人数(3~6)/
   座位（按权重）——换站对是提高成功率的关键。
+- **0_/1_ 配对同解**：同 row 先出 1_，成功后 0_ 复用其基础题号+站对/方向/人数/座位，
+  并按 1_ 的**路线结构**（目标车次/各段购买·乘坐区间/票数，`write_legal_solution`
+  的 route_hint 重放模式）机械重建标答——0_ 题库 = 1_ 题库 − 干扰注入，
+  两题唯一合法解完全相同（对比实验除干扰外完全受控）。
 - 进度实时打印；结束时输出回执汇总（总/成功/失败 + 分布行粒度失败数），
   `--receipt` 可写同构 xlsx。
 - 全程只读 railway.db / prices.db，只写 question/ 目录。

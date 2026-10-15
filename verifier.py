@@ -32,10 +32,9 @@ from common.database import (
 def normalize_final_plan(raw_plan: List[Dict]) -> List[Dict]:
     """统一 final_plan 字段契约。兼容模型输出（from/to）与内部存储
     （from_station_id/to_station_id）两种命名；tickets→int、price→float 类型归一。
-
-    段类型 seg_type：
-    - "purchase"（默认）：购票段，必须含 seat_type/tickets，且必须标注 ride_from/ride_to
-    - "onboard"：上车补票段（DB 无票不查），乘坐区间即 from/to
+    全部条目均按购票段处理（必须含 seat_type/tickets，且必须标注 ride_from/ride_to）；
+    买短补长/买长坐短由「购买区间 from/to + 实际乘坐区间 ride_from/ride_to」单段
+    表达，无独立补票段概念。
 
     缺关键字段 / tickets 非法或 ≤0 / 非 seat_type 的购票段 → 带 "__invalid__": True
     （调用方按 invalid_plan_item 处理，不误判为幻觉）。
@@ -53,20 +52,8 @@ def normalize_final_plan(raw_plan: List[Dict]) -> List[Dict]:
             out.append({"__invalid__": True, "error": "缺关键字段(train_num/from/to)", "raw": item})
             continue
 
-        seg_type = str(item.get("seg_type") or "").strip().lower()
-        is_onboard = seg_type == "onboard" or item.get("onboard") is True
         ride_from = item.get("ride_from_station_id") or item.get("ride_from") or ""
         ride_to = item.get("ride_to_station_id") or item.get("ride_to") or ""
-
-        if is_onboard:
-            out.append({
-                "train_num": str(train_num), "from_station_id": str(from_id),
-                "to_station_id": str(to_id),
-                "ride_from_station_id": str(ride_from or from_id),
-                "ride_to_station_id": str(ride_to or to_id),
-                "seg_type": "onboard",
-            })
-            continue
 
         if not item.get("seat_type"):
             out.append({"__invalid__": True, "error": "购票段缺 seat_type", "raw": item})
@@ -89,7 +76,6 @@ def normalize_final_plan(raw_plan: List[Dict]) -> List[Dict]:
             "ride_from_station_id": "" if missing_ride else str(ride_from),
             "ride_to_station_id": "" if missing_ride else str(ride_to),
             "seat_type": str(item["seat_type"]), "tickets": tickets,
-            "seg_type": "purchase",
         }
         if missing_ride:
             entry["__missing_ride__"] = True
@@ -99,9 +85,6 @@ def normalize_final_plan(raw_plan: List[Dict]) -> List[Dict]:
                 entry["price"] = float(price)
             except (ValueError, TypeError):
                 pass
-        method = item.get("method") or item.get("strategy")
-        if method:
-            entry["method"] = str(method)
         out.append(entry)
     return out
 
@@ -132,7 +115,7 @@ def verify_final_plan(final_plan: List[Dict], question_id: str) -> Dict[str, Any
                                f"{it['to_station_id']} 未标注实际乘坐区间 ride_from/ride_to"
                                "（必须写出）"),
                 })
-    purchase_items = [i for i in valid_items if i.get("seg_type") != "onboard"]
+    purchase_items = valid_items   # 全部有效条目均为购票段（补票段概念已移除）
 
     meta = get_question_metadata(question_id)
     gt = meta.get("ground_truth") or []
@@ -140,7 +123,7 @@ def verify_final_plan(final_plan: List[Dict], question_id: str) -> Dict[str, Any
     selective = meta.get("type") == "选择性"
     start_id = meta.get("start_station_id") or (gt[0]["from_station_id"] if gt else None)
     end_id = meta.get("end_station_id") or (gt[-1]["to_station_id"] if gt else None)
-    gt_purchase = [g for g in gt if g.get("seg_type") != "onboard"]
+    gt_purchase = gt
 
     # ---- 题目库缺失 ----
     db_path = get_question_db_path(question_id)

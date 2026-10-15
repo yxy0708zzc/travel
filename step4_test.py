@@ -12,7 +12,7 @@ step4_test.py —— 测试：与被测模型对话循环（7 工具），轨迹
 用法：
     # 扫描可测题目（信息完备且该模型未测过）
     python step4_test.py --railway-db data/railway.db --prices-db data/prices.db ^
-        --question-dir question --metadata question/metadata.json --logs-test logs/test --list
+        --question-dir question --metadata-nl question/metadata_nl.json --logs-test logs/test --list
 
     # 批量测试
     python step4_test.py ... --model your-model --max-iterations 30 --concurrency 3 [--ids q1 q2]
@@ -29,6 +29,7 @@ import signal
 import sqlite3
 import sys
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -124,7 +125,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "query_tickets",
-            "description": "查询指定车次各站对之间的余票数量。三种座位类型：class2=二等座（经济型），class1=一等座（更舒适），class0=特等座（可躺，十分舒适）。不指定 seat_types 则返回全部三种。不指定 from_station_id/to_station_id 则返回所有站对。",
+            "description": "查询指定车次在指定站对之间的余票数量（不支持整车余票查询，必须给出站对）。三种座位类型：class2=二等座（经济型），class1=一等座（更舒适），class0=特等座（可躺，十分舒适）。不指定 seat_types 则返回全部三种。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -134,10 +135,10 @@ TOOLS = [
                         "items": {"type": "string", "enum": ["class0", "class1", "class2"]},
                         "description": "要查询的座位类型列表，不传则返回全部三种",
                     },
-                    "from_station_id": {"type": "string", "description": "出发站电报码，不传则返回所有站对"},
-                    "to_station_id": {"type": "string", "description": "到达站电报码，不传则返回所有站对"},
+                    "from_station_id": {"type": "string", "description": "出发站电报码"},
+                    "to_station_id": {"type": "string", "description": "到达站电报码"},
                 },
-                "required": ["train_num"],
+                "required": ["train_num", "from_station_id", "to_station_id"],
             },
         },
     },
@@ -206,20 +207,20 @@ def execute_tool(func_name: str, func_args: Dict, question_id: Optional[str]) ->
                     bad = [s for s in seat_types if s not in db.TICKET_TABLES]
                     if bad:   # 席别白名单：非法席别显式报错，不伪造 0 票误导模型
                         return {"error": f"无效座位类型: {bad}，可选 class0/class1/class2"}
+                f, t = func_args.get("from_station_id"), func_args.get("to_station_id")
+                if not f or not t:   # 站对必填：12306 无整车余票能力，不提供全车查询
+                    return {"error": "缺少 from_station_id 或 to_station_id（必须指定站对）"}
                 q_conn = sqlite3.connect(q_path)
                 try:
                     tickets = db.get_train_tickets_filtered(
                         q_conn, func_args.get("train_num", ""),
-                        func_args.get("from_station_id"), func_args.get("to_station_id"),
-                        seat_types)
+                        f, t, seat_types)
                 finally:
                     q_conn.close()
-                # 指定站对但库中无记录 → 返回 0 张（而非缺失键，避免模型误解）
-                f, t = func_args.get("from_station_id"), func_args.get("to_station_id")
-                if f and t:
-                    key = f"{f}|{t}"
-                    for st in (seat_types or db.TICKET_TABLES):
-                        tickets.setdefault(st, {}).setdefault(key, 0)
+                # 站对在库中无记录 → 返回 0 张（而非缺失键，避免模型误解）
+                key = f"{f}|{t}"
+                for st in (seat_types or db.TICKET_TABLES):
+                    tickets.setdefault(st, {}).setdefault(key, 0)
                 return tickets
 
             if func_name == "query_ticket_price":
@@ -307,10 +308,15 @@ def run_chat(message: str, llm: Dict[str, str], max_iterations: int,
     try:
         with requests.Session() as session:
             while iteration < max_iterations:
+                if _STOP:   # 全局停止：当前轮推理完成后不再发起下一轮请求（放弃该题，重跑续测）
+                    return {"error": "已中止", "token_usage": token_usage,
+                            "duration": (datetime.now() - start).total_seconds(),
+                            "iteration_count": iteration, "end_reason": "error", "trace": trace}
                 iteration += 1
                 round_start = datetime.now()
                 log(f"第 {iteration}/{max_iterations} 轮对话：请求模型 {llm['model']}")
 
+                _LLM_LIMITER.wait()   # 全局节流：任意两次请求（含重试）间隔 ≥ 2s
                 resp = session.post(url, json=body, headers=headers,
                                     timeout=config.TEST_CHAT_TIMEOUT)
                 # 已完成轮次耗时即时累计（超时被掐断的本轮不计）
@@ -512,21 +518,58 @@ def testable(metadata: Dict, qid: str, model: str) -> Tuple[bool, str]:
 # ============================================================
 _STOP = False
 
+# ---- 全局请求节流：任意两次 LLM 请求（含失败重试）的发出时刻至少间隔
+#      _REQUEST_MIN_INTERVAL 秒（跨线程共享，账户级限流防护；0 = 关闭）----
+_REQUEST_MIN_INTERVAL = 2.0
+
+
+class _RateLimiter:
+    """跨线程最小间隔限速器（锁内判定+更新原子，多线程下全局间隔不被击穿）"""
+
+    def __init__(self, min_interval: float):
+        self.min_interval = min_interval
+        self._last = 0.0
+        self._lock = threading.Lock()
+
+    def wait(self):
+        if self.min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            if self._last > 0 and now - self._last < self.min_interval:
+                time.sleep(self.min_interval - (now - self._last))
+            self._last = time.monotonic()
+
+
+_LLM_LIMITER = _RateLimiter(_REQUEST_MIN_INTERVAL)
+
+# ---- 失败重试：失败不释放工位，原地等待后重试，直到测完（成功落盘）才补新题 ----
+_RETRY_WAIT_SECONDS = 10     # 每次失败后的重试等待（秒）
+_MAX_ATTEMPTS = 30           # 单题最大尝试次数（首试 + 重试）；超过判终局失败释放工位，
+                             # 防鉴权失效/欠费等永久性错误无限占用队列（约 5 分钟重试窗口，
+                             # 足够跨过限流窗口）
+_NO_RETRY_KEYWORDS = ("401", "unauthorized", "invalid api key", "api key",
+                      "认证", "鉴权", "余额不足", "欠费")   # 重试无意义，立即终局
+_STOP_EVENT = threading.Event()   # 中断时立即唤醒重试等待（替代不可中断的 sleep）
+
 
 def _shutdown_handler(sig, frame):
     global _STOP
     if _STOP:
         os._exit(130)   # 第二次：立即强退（已完成题目均已即时落盘，不受影响）
     _STOP = True
-    print("\n🛑 收到中断：在跑的题测完并落盘后停止，不再开始新题；重跑同命令自动续测"
-          "（再按一次 Ctrl+C 强制退出）")
+    _STOP_EVENT.set()   # 立即唤醒所有重试等待中的工位
+    print("\n🛑 收到中断：不再开始新题；在跑的题在当前轮推理结束后放弃"
+          "（不落盘，重跑同命令自动续测）；再按一次强制退出")
 
 
 def run_batch(llm: Dict[str, str], qids: List[str], max_iterations: int,
               concurrency: int, logs_dir: str) -> List[Dict]:
     """并发批量测试：每题独立对话 → 落盘 → state=tested（仅成功推进）。
-    任务动态派发：在跑题数始终 ≤ concurrency；Ctrl+C 后不再派发新题，
-    在跑的题自然测完收尾（一次性全部提交会让线程池退出等待拖住全部待测题）。"""
+    任务动态派发：在跑题数始终 ≤ concurrency；失败的题**不释放工位**，
+    原地等 _RETRY_WAIT_SECONDS 秒重试（上限 _MAX_ATTEMPTS 次），只有测完
+    （成功落盘）才补新题；Ctrl+C 后不再派发新题，在跑的题在当前轮推理
+    结束后放弃（不落盘，重跑续测）。"""
     model = llm["model"]
     metadata = db.load_metadata()
     todo = []
@@ -550,22 +593,40 @@ def run_batch(llm: Dict[str, str], qids: List[str], max_iterations: int,
                   f"{'✔' if level == 'success' else '✘' if level == 'error' else '·'}"
                   f"（{seq}/{len(todo)}）{qid} {msg}")
 
-        try:
-            chat = run_chat(entry.get("nl_question", ""), llm, max_iterations,
-                            question_id=qid, log=plog)
-            if chat.get("error"):
-                raise RuntimeError(chat["error"])
-            record = save_test_record(chat, qid, model,
-                                      entry.get("nl_question", ""), logs_dir)
-            db.set_question_model_state(qid, model, "tested")   # 只记成功；成功后同模型不可重测
-            plog(f"完成 plan_status={record['plan_status']}，模型调用 {record['model_calls']} 次，"
-                 f"工具调用 {record['tool_calls']} 次，耗时 {round(record['duration'], 1)}s → {record['filename']}",
-                 "success")
-            return {"question_id": qid, "ok": True, "error": None, "filename": record["filename"],
-                    "plan_status": record["plan_status"]}
-        except Exception as e:
-            plog(f"测试失败：{e}", "error")
-            return {"question_id": qid, "ok": False, "error": str(e)}
+        attempt = 0
+        while True:   # 失败不释放工位：原地重试直到测完（成功落盘）才返回、补新题
+            attempt += 1
+            if _STOP:   # 全局停止：未完成的题放弃（“收到中断”已全局提示一次，逐题不再重复）
+                plog("已中止（未完成，重跑续测）", "error")
+                return {"question_id": qid, "ok": False, "error": "收到中断"}
+            try:
+                chat = run_chat(entry.get("nl_question", ""), llm, max_iterations,
+                                question_id=qid, log=plog)
+                if chat.get("error"):
+                    raise RuntimeError(chat["error"])
+                record = save_test_record(chat, qid, model,
+                                          entry.get("nl_question", ""), logs_dir)
+                db.set_question_model_state(qid, model, "tested")   # 只记成功；成功后同模型不可重测
+                plog(f"完成 plan_status={record['plan_status']}，模型调用 {record['model_calls']} 次，"
+                     f"工具调用 {record['tool_calls']} 次，耗时 {round(record['duration'], 1)}s → {record['filename']}",
+                     "success")
+                return {"question_id": qid, "ok": True, "error": None, "filename": record["filename"],
+                        "plan_status": record["plan_status"]}
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                if attempt >= _MAX_ATTEMPTS or _STOP \
+                        or any(k in low for k in _NO_RETRY_KEYWORDS):
+                    reason = ("重试上限" if attempt >= _MAX_ATTEMPTS else
+                              "收到中断" if _STOP else "永久性错误（不重试）")
+                    plog(f"测试失败（第 {attempt} 次尝试，{reason}）：{msg}", "error")
+                    return {"question_id": qid, "ok": False, "error": msg}
+                plog(f"第 {attempt} 次尝试失败：{msg} —— 原地重试（工位保留，"
+                     f"第 {attempt + 1}/{_MAX_ATTEMPTS} 次）", "warn")
+                _STOP_EVENT.wait(_RETRY_WAIT_SECONDS)   # 等待可被中断立即唤醒
+                if _STOP:   # 等待期间收到中断：不再重试，重跑续测
+                    plog("已中止（未完成，重跑续测）", "error")
+                    return {"question_id": qid, "ok": False, "error": "收到中断"}
 
     concurrency = max(1, min(int(concurrency or 1), 8))
     pending = list(todo)   # 待提交队列（保持原顺序）

@@ -11,11 +11,14 @@ step5_eval.py —— 测评与统计：核查测试记录 → 结果落盘 → �
 
 用法：
     python step5_eval.py eval   --logs-test logs/test --logs-result logs/result ^
-        --question-dir question --railway-db data/railway.db [--ids f1.json f2.json] [--re-evaluate]
+        --question-dir question --metadata-nl question/metadata_nl.json ^
+        --railway-db data/railway.db --prices-db data/prices.db [--ids f1.json f2.json] [--re-evaluate]
     python step5_eval.py stats  --logs-result logs/result --logs-test logs/test ^
-        --question-dir question --railway-db data/railway.db
+        --question-dir question --metadata-nl question/metadata_nl.json ^
+        --railway-db data/railway.db --prices-db data/prices.db
     python step5_eval.py report --logs-result logs/result --logs-test logs/test ^
-        --report-dir logs/report --question-dir question --railway-db data/railway.db
+        --report-dir logs/report --question-dir question --metadata-nl question/metadata_nl.json ^
+        --railway-db data/railway.db --prices-db data/prices.db
 """
 
 import argparse
@@ -141,7 +144,6 @@ def run_eval(logs_test: str, logs_result: str, ids: list, re_evaluate: bool):
                     "issue_count": verification.get("issue_count", 0),
                     "total_tokens": tu.get("total_tokens", 0),
                     "duration_seconds": data.get("duration", 0),
-                    "tool_calls": [],
                 },
                 "verification": verification,
                 "human_confirmed": False,
@@ -182,13 +184,6 @@ def run_eval(logs_test: str, logs_result: str, ids: list, re_evaluate: bool):
 # stats 子命令（聚合口径同参考 aggregator）
 # ============================================================
 
-def _trace_counts(test_data: dict) -> tuple:
-    """从测试记录 trace 统计 (模型调用, 工具调用)：assistant 轮数 / 各轮嵌套 tools 总和"""
-    trace = test_data.get("trace") or []
-    rounds = [e for e in trace if isinstance(e, dict) and e.get("type") == "assistant"]
-    return len(rounds), sum(len(e.get("tools") or []) for e in rounds)
-
-
 def aggregate(logs_result: str, logs_test: str) -> dict:
     results = load_results(logs_result)
     if not results:
@@ -222,11 +217,9 @@ def aggregate(logs_result: str, logs_test: str) -> dict:
             if td:
                 total_tokens += (td.get("token_usage") or {}).get("total_tokens", 0)
                 total_duration += td.get("duration", 0)
-                mc, tc = _trace_counts(td)
-                # 双调用计数：优先测试记录显式字段，旧记录由 trace 推导兜底
-                total_model += td["model_calls"] if td.get("model_calls") is not None else mc
-                total_tool += td["tool_calls"] if td.get("tool_calls") is not None else tc
-        k = len(td_map)
+                total_model += td.get("model_calls") or 0
+                total_tool += td.get("tool_calls") or 0
+        k = sum(1 for td in td_map.values() if td)   # 只数成功读取的记录（读取失败=空 dict，不摊薄均值）
 
         issue_types: dict = {}
         for r in group:

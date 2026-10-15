@@ -293,7 +293,9 @@ def main():
         sys.exit(f"❌ 模型配置缺失：{'、'.join(missing)}（命令行传入或写 .env，系统不默认任何平台）")
 
     db.configure_paths(metadata=args.metadata, metadata_nl=args.metadata_nl)
-    metadata = db.load_metadata()   # 已合并 NL 独立产物（避免"默认跳过"判断失效）
+    # 目标扫描基准 = metadata.json（step2 出题产物）。metadata_nl 是本步的输出，
+    # 首跑尚不存在，不能作为扫描源（load_metadata() 只适合 step3 之后的 step4/5）。
+    metadata = db.read_metadata_file(args.metadata)
 
     targets = [(qid, m) for qid, m in metadata.items()
                if isinstance(m, dict) and m.get("question")]
@@ -311,7 +313,8 @@ def main():
     elif args.force:
         target_groups = groups
     else:
-        merged_nl = {qid: m.get("nl_question") for qid, m in targets}
+        nl_map = db.read_metadata_file(args.metadata_nl)
+        merged_nl = {qid: (nl_map.get(qid) or {}).get("nl_question") for qid, _ in targets}
         target_groups = [g for g in groups if not all(merged_nl.get(q) for q in g["qids"])]
         skipped = len(groups) - len(target_groups)
         if skipped:

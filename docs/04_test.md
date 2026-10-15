@@ -21,19 +21,115 @@ python step4_test.py --railway-db ... --prices-db ... --question-dir ... \
 
 ## 2. 工具集（被测模型的全部能力，OpenAI Tools 格式）
 
-| 工具 | 数据源 | 说明 |
-|---|---|---|
-| `query_trains_between_stations` | railway.db | 两站间车次及实际到发时间（不含始发/终到站） |
-| `query_trains_at_station` | railway.db（station_trains 物化视图） | 经停某站的车次及在该站时刻 |
-| `query_train_detail` | railway.db | 车次完整经停（序号/站名/电报码/时间） |
-| `list_stations` | railway.db | 站名/电报码搜索，关键词 + 分页（limit≤200） |
-| `list_trains` | railway.db | 车次号搜索，同上 |
-| `query_tickets` | **question/{qid}.db** | 当前题目库余票：席别白名单校验（非法席别显式报错，不伪造 0 票）；指定站对但无行 → 显式补 0（稀疏存储无行=0 票） |
-| `query_ticket_price` | prices.db | 三席别票价；查不到返回 null |
+通用约定：
 
-设计约束：工具内任何异常都以 `{"error": ...}` 返回给模型（对话不中断）；
-题目上下文（qid）**按调用传参**贯穿 run_chat → execute_tool，
-无全局可变状态——并发测试不会串题（参考项目曾因全局"当前题目"串题污染数据集）。
+- 所有工具都是**本地 SQLite 只读查询**（无网络）；任何异常（含未知工具名）统一
+  返回 `{"error": "..."}`，对话不中断。
+- `station_id` = 12306 **电报码**（VNP=北京南、AOH=上海虹桥…）。模型获得电报码的
+  唯一途径是 `list_stations`。
+- 题目上下文（qid）**按调用传参**贯穿 run_chat → execute_tool，无全局可变状态——
+  并发测试不会串题。
+
+### 2.1 query_trains_between_stations —— 查两站间直达车次
+
+| 输入 | 必填 | 说明 |
+|---|---|---|
+| `from_station_id` | ✅ | 出发站电报码 |
+| `to_station_id` | ✅ | 到达站电报码 |
+
+输出：数组（按出发时刻升序），元素含车次号、两站到发时刻与旅程时长；
+两站间无直达车 → `[]`。
+
+```json
+[{"train_num": "G1", "depart_time": "08:00", "arrive_time": "12:30", "duration": "04:30"}]
+```
+
+说明：`depart_time`/`arrive_time` 是该车在 from/to 站的实际到发时刻（HH:MM）；
+`duration` = 两者差值，跨天回绕 +24h（>24h 的长途车显示如 `"25:10"`）。
+
+### 2.2 query_trains_at_station —— 查经停某站的车次
+
+| 输入 | 必填 | 说明 |
+|---|---|---|
+| `station_id` | ✅ | 车站电报码 |
+
+输出：数组（按车次号排序），元素 = 车次号 + 该站时刻：
+
+```json
+[{"train_num": "G1", "stop_time": "08:00"}, {"train_num": "G11", "stop_time": "09:15"}]
+```
+
+站不存在 → `{"error": "车站 VNP 未找到"}`。
+
+### 2.3 query_train_detail —— 查车次完整经停
+
+| 输入 | 必填 | 说明 |
+|---|---|---|
+| `train_num` | ✅ | 车次号 |
+
+输出：`{"stops": [...]}`，按站序升序（站序 = 经停顺序，可用于判断经过关系与方向）：
+
+```json
+{"stops": [
+  {"stop_no": 1, "station_id": "VNP", "station_name": "北京南", "stop_time": "08:00"},
+  {"stop_no": 2, "station_id": "JGK", "station_name": "济南西", "stop_time": "09:38"}
+]}
+```
+
+车次不存在或无经停数据 → `{"error": "车次 G999 未找到或无经停数据"}`。
+
+### 2.4 list_stations —— 搜车站（拿电报码）
+
+| 输入 | 必填 | 说明 |
+|---|---|---|
+| `keyword` | — | 关键词，**站名或电报码均可**（LIKE 模糊匹配） |
+| `limit` | — | 每页数量，默认 50，最大 200 |
+| `page` | — | 页码，默认 1 |
+
+输出：数组（按站名排序）：`[{"station_id": "VNP", "station_name": "北京南"}]`。
+全库约 3300 站，不传 `keyword` 会只返回第一页——找特定站必须带关键词。
+
+### 2.5 list_trains —— 搜车次号
+
+| 输入 | 必填 | 说明 |
+|---|---|---|
+| `keyword` | — | 匹配车次号（LIKE 模糊，如 `G1` 命中 G1/G10/G100…） |
+| `limit` | — | 同 2.4 |
+| `page` | — | 同 2.4 |
+
+输出：数组（按车次号排序）：`[{"train_num": "G1"}]`。全库约 4800 个 G 车次。
+
+### 2.6 query_tickets —— 查本题余票（读当前题 `question/{qid}.db`）
+
+| 输入 | 必填 | 说明 |
+|---|---|---|
+| `train_num` | ✅ | 车次号 |
+| `seat_types` | — | 席别数组（或逗号分隔串），白名单 `class0/class1/class2`，不传=全部三种 |
+| `from_station_id` | ✅ | 出发站电报码 |
+| `to_station_id` | ✅ | 到达站电报码 |
+
+输出：`席别 → "出发电报码|到达电报码" → 余票数` 两层字典：
+
+```json
+{"class2": {"VNP|JGK": 12, "VNP|AOH": 0}, "class1": {"VNP|JGK": 8}, "class0": {}}
+```
+
+边界行为：**题目库为稀疏存储，无行 = 0 张**；指定站对在库中无记录时显式补
+`0`（避免模型把“缺失”误解为有票）；`seat_types` 含白名单外的值 → 显式报错
+（不伪造 0 票误导模型）；**站对必填**——12306 不提供整车余票能力，缺站对时
+显式报错不查询。**只有本工具读题目库**——题内余票是本题私有数据。
+
+### 2.7 query_ticket_price —— 查票价
+
+| 输入 | 必填 | 说明 |
+|---|---|---|
+| `train_num` / `from_station_id` / `to_station_id` | ✅ | 车次 + 站对（电报码） |
+
+输出：`席别 → 票价(元)`，只含查到的席别；该区间全部无票价数据 → `null`：
+
+```json
+{"class2": 553.0, "class1": 923.0, "class0": 1723.0}
+```
 
 ## 3. 对话循环（run_chat）
 
@@ -109,9 +205,17 @@ messages = [SYSTEM_PROMPT, user=nl_question]
 
 - 先 `--list` 核对待测集合，再正式运行；`--concurrency` 1~8
   （模型限流严的用 1~3）。
-- 中途想停按一次 **Ctrl+C**：在跑的题（≤并发数）测完并落盘，未开始的不启动；
-  已成功的题 state=tested 即时写入，重跑同命令自动续测剩余部分。
-  再按一次强制退出（已完成的不受影响）。
+- 中途想停按一次 **Ctrl+C**：不再派发新题，在跑的题在**当前轮推理结束后**放弃
+  （不落盘，一般 ≤1 分钟内程序退出）；已完成的题已即时落盘，重跑同命令
+  自动续测剩余部分。**再按一次强制退出：立即杀死进程**，正在跑没结束的题
+  全部放弃（已完成的不受影响）。
+- 单题失败（限流/超时/网络等）**不释放工位**：原地等 10s 重试（上限 30 次，
+  鉴权/余额类永久性错误不重试立即终局），避免启动瞬间并发触发 API 限流的
+  雪崩连锁失败；重试参数在 step4_test.py 顶部常量（`_RETRY_WAIT_SECONDS`/
+  `_MAX_ATTEMPTS`）。
+- 所有 LLM 请求（含重试）经**全局节流**：任意两次请求发出间隔 ≥ 2s
+  （`_REQUEST_MIN_INTERVAL`，跨工位共享的加锁限速器，锁内判定+更新原子；
+  设 0 关闭）。高并发下实际吞吐上限 = 1 请求 / 2s。
 - 失败（error/超时）不推进 state，可直接重跑同题；
   成功后重测同模型会被跳过——需要重测时手工删除
   metadata_nl.json 中对应条目的 `state` 项与 logs/test 记录。

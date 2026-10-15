@@ -170,12 +170,10 @@ def _purchase_segment(train_num: str, buy_from: str, buy_to: str, ride_from: str
         "from_station_id": buy_from, "to_station_id": buy_to,
         "ride_from": names.get(ride_from, ride_from), "ride_to": names.get(ride_to, ride_to),
         "ride_from_station_id": ride_from, "ride_to_station_id": ride_to,
-        "tickets": tickets, "seat_type": seat_type, "seg_type": "purchase",
+        "tickets": tickets, "seat_type": seat_type,
     }
     if strategy:
         seg["strategy"] = strategy
-        seg["actual_from"] = seg["ride_from"]
-        seg["actual_to"] = seg["ride_to"]
     return seg
 
 
@@ -232,14 +230,40 @@ def _apply_strategy(q_conn, rw, strategy: str, train_num: str, stops: List[Dict]
 def write_legal_solution(q_conn, rw, question_type: str, train_num: str, stops: List[Dict],
                          from_idx: int, to_idx: int, segment_plans: List[str],
                          transfer_dest: Optional[str], to_id: str, seat_type: str,
-                         people_count: int, rng: random.Random) -> Dict:
+                         people_count: int, rng: random.Random,
+                         route_hint: Optional[Dict] = None) -> Dict:
     """写标答（正数票）。transfer 用核心一均匀随机挑 (M, U)；mixed 按段策略逐段换乘。
     to_id = 用户真实目的地（mixed 的路径终点；to_idx 是目标车 T 的末站，二者不同——
     T 故意不经过 B，其末站并非目的地）。返回 {"segments": [...]}。
-    任何"此车不合适"都抛 RetryTrainError 换下一辆。"""
+    任何"此车不合适"都抛 RetryTrainError 换下一辆。
+
+    route_hint（配对重放）：非空时忽略上述全部随机逻辑，按 1_ 成功题记录的路线结构
+    （各段车次/购买区间/乘坐区间/票数）机械重建标答——0_ 与 1_ 同解的保证。"""
     ids = [s["station_id"] for s in stops]
     names = {s["station_id"]: s["station_name"] for s in stops}
     segments: List[Dict] = []
+
+    if route_hint:
+        # 重放模式：同库同数据下必然可行（结构来自本进程刚生成成功的 1_ 题），
+        # 异常属于程序错误，直接 GenerateError（重放没有"换下一辆"的概念）
+        for leg in route_hint["legs"]:
+            cur_train = str(leg["train_num"])
+            cur_stops = db.get_train_stops(rw, cur_train)
+            cur_ids = [s["station_id"] for s in cur_stops]
+            leg_names = {s["station_id"]: s["station_name"] for s in cur_stops}
+            buy_from, buy_to = str(leg["buy_from"]), str(leg["buy_to"])
+            ride_from, ride_to = str(leg["ride_from"]), str(leg["ride_to"])
+            tk = int(leg["tickets"])
+            if (buy_from not in cur_ids or buy_to not in cur_ids
+                    or cur_ids.index(buy_from) >= cur_ids.index(buy_to)
+                    or ride_from not in cur_ids or ride_to not in cur_ids
+                    or cur_ids.index(ride_from) >= cur_ids.index(ride_to)):
+                raise GenerateError(f"标答路线重放失败：车次 {cur_train} 上 "
+                                    f"{buy_from}→{buy_to}（乘 {ride_from}→{ride_to}）不可重建")
+            db.update_ticket(q_conn, cur_train, buy_from, buy_to, seat_type, tk)
+            segments.append(_purchase_segment(cur_train, buy_from, buy_to, ride_from, ride_to,
+                                              leg_names, tk, seat_type, leg.get("strategy")))
+        return {"segments": segments}
 
     if question_type == "transfer":
         actual_dest = transfer_dest or ids[to_idx]
@@ -450,11 +474,13 @@ def self_check(q_conn, segments: List[Dict], people_count: int,
 
 def generate_question(params: GenerateParams, prefix: str, mode: str,
                       interference_mode: str, density: float,
-                      rng: random.Random) -> Tuple[str, Dict]:
+                      rng: random.Random,
+                      route_hint: Optional[Dict] = None) -> Tuple[str, Dict]:
     """生成一道题并直接落盘。返回 (question_id, summary)；重试耗尽抛 GenerateError。
 
     prefix: "0_"/"1_"（存在性）/"2_"（选择性）；mode: existence/selective
     interference_mode: none / interference / random_tickets
+    route_hint: 配对重放的路线结构（0_ 复用 1_ 的解，保证同解；非配对题不传）
     """
     # ---- 选择性题题型自动推导（保证有解）：禁换乘 → 买短补长，否则换乘 ----
     if mode == "selective":
@@ -501,8 +527,11 @@ def generate_question(params: GenerateParams, prefix: str, mode: str,
         if not db.validate_station_exists(rw, to_id):
             raise GenerateError(f"到达站 {to_id} 不存在")
 
-        # 候选车次：transfer/mixed 用"不经过 B"的候选集，其余为直达车次
-        if params.question_type in ("transfer", "mixed"):
+        # 候选车次：transfer/mixed 用"不经过 B"的候选集，其余为直达车次；
+        # 配对重放（route_hint）时锁定 1_ 成功题的目标车次，不再候选/随机
+        if route_hint:
+            routes = [{"train_num": route_hint["target_train"]}]
+        elif params.question_type in ("transfer", "mixed"):
             routes = _transfer_candidates(rw, from_id, to_id)
         else:
             routes = db.get_routes_between(rw, from_id, to_id)
@@ -510,7 +539,7 @@ def generate_question(params: GenerateParams, prefix: str, mode: str,
             raise GenerateError(f"未找到从 {from_id} 到 {to_id} 的车次")
 
         rng.shuffle(routes)
-        existing_metadata = db.load_metadata()   # 题号查重基准（读一次）
+        existing_metadata = db.read_metadata_file(db._path("metadata"))   # 题号查重基准=metadata.json（读一次）
 
         last_error = None
         for attempt in range(min(len(routes), 15)):
@@ -566,7 +595,8 @@ def generate_question(params: GenerateParams, prefix: str, mode: str,
                 segments = write_legal_solution(
                     q_conn, rw, params.question_type, target_train, stops,
                     cur_from_idx, cur_to_idx, params.segment_plans, transfer_dest,
-                    to_id, params.seat_type, params.people_count, rng)["segments"]
+                    to_id, params.seat_type, params.people_count, rng,
+                    route_hint=route_hint)["segments"]
 
                 solution_occupied = {(s["train_num"], s["from_station_id"], s["to_station_id"])
                                      for s in segments}
@@ -667,6 +697,20 @@ def generate_question(params: GenerateParams, prefix: str, mode: str,
 # 批量出题
 # ============================================================
 
+def _route_hint_from(summary: Dict) -> Dict:
+    """从 1_ 成功题的出题摘要提取路线结构（供配对 0_ 重放，保证 0_/1_ 同解）：
+    目标车次 + 各段（车次/策略/购买区间/乘坐区间/票数）。"""
+    return {
+        "target_train": summary["target_train_num"],
+        "legs": [{"train_num": s["train_num"],
+                  "strategy": s.get("strategy"),
+                  "buy_from": s["from_station_id"], "buy_to": s["to_station_id"],
+                  "ride_from": s["ride_from_station_id"], "ride_to": s["ride_to_station_id"],
+                  "tickets": s["tickets"]}
+                 for s in summary["solution_segments"]],
+    }
+
+
 def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: List[List[str]],
               seat_weights: Dict[str, float], interference_density: float,
               random_tickets_density: float, max_retries: int) -> Dict:
@@ -689,12 +733,14 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     def generate_one(qtype, transfers, plans, criterion, constraints_, prefix, imode, density,
-                     custom_qid_base: str = None, reuse: dict = None):
+                     custom_qid_base: str = None, reuse: dict = None, route_hint: dict = None):
         """重试 ≤ max_retries，每次重随机站对/方向/人数/座位。
-        成功返回 (qid, 尝试数, None, 首次序号, 随机参数)，失败返回 (None, max_retries, 错误, 首次序号, None)。
+        成功返回 (qid, 尝试数, None, 首次序号, 随机参数, 路线结构)，
+        失败返回 (None, max_retries, 错误, 首次序号, None, None)。
         custom_qid_base：配对题复用的基础号（同 row 的 0_ 复用 1_ 的），否则按 seq 递增生成。
         reuse：配对题复用的随机参数（站对/方向/人数/座位）——0_ 与 1_ 题面一致才能被
-        step3 按「基础题号+内容」配对共享文案（对比实验前提）；不传则独立随机。"""
+        step3 按「基础题号+内容」配对共享文案（对比实验前提）；不传则独立随机。
+        route_hint：配对题重放的路线结构（仅 0_ 传入，来自 1_ 成功题）——保证 0_/1_ 同解。"""
         nonlocal seq
         last_err = ""
         first_seq = None
@@ -727,37 +773,43 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
                 constraints=constraints_,
             )
             try:
-                qid, _ = generate_question(params, prefix,
-                                           "existence" if prefix != "2_" else "selective",
-                                           imode, density, rng=random.Random())
+                qid, summary = generate_question(params, prefix,
+                                                 "existence" if prefix != "2_" else "selective",
+                                                 imode, density, rng=random.Random(),
+                                                 route_hint=route_hint)
                 used = None if reuse else {"pair": pair, "a": a, "b": b,
                                            "people": people, "seat": seat}
-                return qid, attempt, None, first_seq, used
+                # 1_ 成功题的路线结构：供配对 0_ 重放（保证 0_/1_ 同解，题库仅差干扰）
+                hint_out = _route_hint_from(summary) if (prefix == "1_" and qid) else None
+                return qid, attempt, None, first_seq, used, hint_out
             except (GenerateError, db.PathsNotConfigured) as e:
                 last_err = str(e)
             except Exception as e:
                 last_err = str(e)
-        return None, max_retries, last_err, first_seq, None
+        return None, max_retries, last_err, first_seq, None, None
 
-    # ---- 存在性：1_ 干扰 / 0_ 无注入（同 row 共享基础号与随机参数 → 题面一致，
-    #      step3 按「基础题号+内容」配对共享文案，对比实验前提） ----
+    # ---- 存在性：1_ 干扰 / 0_ 无注入（同 row 配对：共享基础号+随机参数保证题面一致，
+    #      0_ 另复用 1_ 的路线结构重放标答 → 同解，两题题库仅差干扰注入） ----
     for idx, row in enumerate(distribution):
         label = f"{row.get('category', '')}/{row.get('name', '')}"
         ones_base = None   # 同 row 1_ 成功后的基础号（B..._NNNN），最近的 0_ 复用以配对
         ones_rand = None   # 同 row 1_ 成功那次的随机参数（站对/方向/人数/座位）
+        ones_hint = None   # 同 row 1_ 成功那次的路线结构（供 0_ 重放，保证同解）
         for key, prefix, imode, tag in (("has_interference", "1_", "interference", "干扰"),
                                         ("no_interference", "0_", "none", "无干扰")):
             for _ in range(int(row.get(key) or 0)):
-                pair_base = reuse = None
+                pair_base = reuse = hint = None
                 if prefix == "0_" and ones_base:
-                    # 用掉即焚：基础号防重号冲突，随机参数保证 0_/1_ 题面一致
+                    # 用掉即焚：基础号防重号冲突，随机参数保证 0_/1_ 题面一致，
+                    # 路线结构重放保证同解（0_ 题库 = 1_ 题库 − 干扰注入）
                     pair_base, ones_base = ones_base, None
                     reuse, ones_rand = ones_rand, None
-                qid, tries, err, sq, rand_used = generate_one(
+                    hint, ones_hint = ones_hint, None
+                qid, tries, err, sq, rand_used, hint_out = generate_one(
                     row["question_type"], int(row.get("transfers") or 0),
                     row.get("segment_plans") or [], "comprehensive",
                     [], prefix, imode, interference_density,
-                    custom_qid_base=pair_base, reuse=reuse)
+                    custom_qid_base=pair_base, reuse=reuse, route_hint=hint)
                 details.append({"question_id": qid or f"{prefix}B{timestamp}_{sq:04d}",
                                 "row": f"{label}/{tag}", "attempts": tries,
                                 "ok": qid is not None, "error": err})
@@ -768,6 +820,7 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
                     if prefix == "1_":
                         ones_base = qid[len(prefix):]   # "1_B..._0005" → "B..._0005"
                         ones_rand = rand_used
+                        ones_hint = hint_out
                     log(f"[{sq:04d}] {prefix} 存在性（{tag}）{label} → {qid}（尝试 {tries} 次）", "success")
 
     # ---- 选择性：2_ 随机票（题型由行为约束推导） ----
@@ -776,8 +829,8 @@ def run_batch(distribution: List[Dict], selective_rows: List[Dict], stations: Li
         crit, beh = row.get("criterion", "comprehensive"), row.get("behavior", "none")
         constraints_ = [] if beh == "none" else [beh]
         for _ in range(int(row.get("count") or 0)):
-            qid, tries, err, sq, _rand = generate_one(None, 0, [], crit, constraints_,
-                                                      "2_", "random_tickets", random_tickets_density)
+            qid, tries, err, sq, _rand, _hint = generate_one(None, 0, [], crit, constraints_,
+                                                             "2_", "random_tickets", random_tickets_density)
             details.append({"question_id": qid or f"2_B{timestamp}_{sq:04d}",
                             "row": f"{criterion_cn(crit)}/{behavior_cn(beh)}",
                             "attempts": tries, "ok": qid is not None, "error": err})

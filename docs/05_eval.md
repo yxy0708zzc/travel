@@ -28,8 +28,9 @@ eval 语义：
 ### 层0 归一化（normalize_final_plan）
 - 兼容两种字段命名：模型输出 `from/to` ≡ 内部 `from_station_id/to_station_id`；
   tickets→int、price→float 类型归一。
-- 段类型：`purchase`（默认，必须含 seat_type/tickets，且必须标注实际乘坐区间
-  ride_from/ride_to）与 `onboard`（补票段，DB 无票不查）。
+- 全部条目均按购票段核查（必须含 seat_type/tickets，且必须标注实际乘坐区间
+  ride_from/ride_to）；买短补长/买长坐短由「购买区间 + ride 乘坐区间」单段表达，
+  无独立补票段概念。
 - 非法条目（缺关键字段/缺 seat_type/tickets 非法或 ≤0/非对象）→ 带 `__invalid__`，
   作为 `invalid_plan_item` 问题处理，**不误判为幻觉**。
 - **缺 ride 一律按不全（不兜底）**：ride 留空 + `__missing_ride__`，
@@ -106,8 +107,7 @@ eval 语义：
   no_plan/empty_plan/db_not_found 单列。
 - 按模型指标：total / pass_rate / error_rate / no_plan / empty / db_not_found /
   unknown 计数与比率；**avg_tokens / avg_duration / avg_model_calls /
-  avg_tool_calls**（读关联测试记录：双调用计数优先显式字段，旧记录由 trace
-  推导兜底——assistant 轮数与各轮嵌套 tools 总和）；问题码分布。
+  avg_tool_calls**（读关联测试记录的显式 model_calls / tool_calls 字段）；问题码分布。
 - report 排名按 pass_rate 降序；题型维度两组：`by_type`（存在性/选择性）、
   `by_question_type`（五题型，读 metadata_nl 事实源）；error_rate>10% 出警告；
   自动洞察（最高/最低通过率、题型从易到难排序）。
@@ -117,5 +117,6 @@ eval 语义：
 
 - step2 出题的标答自反校验直接调用 `verifier.check_strategy_constraints`——
   出题端与核查端同一约束实现，杜绝口径漂移。
-- step4 的 final_plan 解析复用 `verifier.normalize_final_plan`——
-  模型输出、记录归一、核查入口三层同一契约。
+- step4 的 final_plan 解析（`parse_ai_final_plan`）只做 JSON 提取（字符串感知
+  括号配对 + ```json 代码块兜底），不做字段归一；`normalize_final_plan` 仅在
+  step5 核查入口调用——测试记录保存模型原话，字段归一口径只在核查侧生效。
