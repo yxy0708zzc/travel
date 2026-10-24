@@ -10,6 +10,7 @@
 ```
 12306 ──step1──▶ railway.db + prices.db ──step1 cleanup/overnight──▶ 清洗后的数据
                         │
+                        │ (assist 可选：按直达车次数采样生成 2.xlsx 站对表)
                         ▼ (step2 读)
         1.xlsx 分布表 + 2.xlsx 站对表 ──step2──▶ question/*.db + metadata.json
                         │                       （出题产物，step3 后归档只读）
@@ -41,8 +42,9 @@ travel2/
 ├── step4_test.py      # ④ 测试（7 工具对话循环 + 轨迹落盘）
 ├── step5_eval.py      # ⑤ 测评与统计（eval/stats/report）
 ├── verifier.py        # 核查规则库（step5 调用；step2/4 复用其子函数）
+├── assist/            # 辅助工具（按直达车次数分区段采样站对表，见 docs/06）
 ├── templates/         # 1.xlsx 分布表模板 + 2.xlsx 站对表模板
-├── docs/              # 五个模块的技术细节文档（认真读完再用）
+├── docs/              # 各模块技术细节文档（认真读完再用）
 └── .env.example       # API 配置模板（复制为 .env 填写）
 ```
 
@@ -65,7 +67,12 @@ python step1_collect.py prices   --railway-db data\railway.db --prices-db data\p
 python step1_collect.py cleanup  --railway-db data\railway.db --prices-db data\prices.db
 python step1_collect.py overnight --railway-db data\railway.db --prices-db data\prices.db --apply
 
-rem ② 批量出题（模板见 templates/；座位权重和=100）
+rem ①.5 可选：按直达车次数分区段采样生成站对表（替代模板 2.xlsx，详见 docs/06_assist.md；分隔符用逗号）
+python assist\filter_pairs_by_direct.py --railway-db data\railway.db ^
+    --ranges 0~10,20~60,100~200 --counts 10,20,30 ^
+    --attempts-multiplier 300 --out 2_站对表.xlsx --seed 42
+
+rem ② 批量出题（模板见 templates/；座位权重和=100；--stations 也可换 assist 生成的站对表）
 python step2_generate.py --railway-db data\railway.db --prices-db data\prices.db ^
     --question-dir question --distribution templates\1_题目分布表模板.xlsx ^
     --stations templates\2_到发站对表模板.xlsx ^
@@ -92,6 +99,29 @@ python step5_eval.py report --logs-result logs\result --logs-test logs\test ^
     --report-dir logs\report --question-dir question --metadata-nl question\metadata_nl.json ^
     --railway-db data\railway.db --prices-db data\prices.db
 ```
+
+## 辅助工具（assist/）
+
+### filter_pairs_by_direct.py —— 按直达车次数分区段采样站对表
+
+先全库穷举统计各站对直达数（秒级），再按区间精确筛选随机抽取（凑够个数即停），
+生成 step2 `--stations` 可直接消费的站对表，用于控制题面直达难度
+（如换乘题配 0 直达、直达题配 3~5 趟）：
+
+```bat
+python assist\filter_pairs_by_direct.py --railway-db data\railway.db ^
+    --ranges 0~10,20~60,100~200 --counts 10,20,30 ^
+    --attempts-multiplier 300 --out 2_站对表.xlsx --seed 42
+```
+
+- `--ranges`/`--counts`：`|` 分隔区段、`~` 连接上下限，**个数必须一致**；
+  允许 min=0（无直达）与 min==max（精确匹配）
+- 输出按区间分块，每块上方一行元数据（第 4 列=范围、第 5 列=个数）；
+  step2 读入自动跳过（只读前 2 列，连续 ≥4 空行=表结束）
+- 跨区间全局去重；先穷举后筛选，各区间**必然收满**（除非候选池本身不足，
+  会 ⚠️ 提示；如 100~200 全库仅 22 对）
+
+详见 docs/06_assist.md。
 
 ## 参数说明（全部参数）
 
@@ -271,3 +301,4 @@ API 配置优先级：命令行显式参数 > `.env`（`TEST_*`/`NL_*` → `DEFA
 | docs/03_nl.md | 自然语言化：提示词、分组规则、并发模型 |
 | docs/04_test.md | 测试：工具定义、对话循环、token 口径、记录结构 |
 | docs/05_eval.md | 测评：核查判定体系、问题码全表、统计口径 |
+| docs/06_assist.md | 辅助工具：按直达车次数分区段随机采样站对表（assist/） |

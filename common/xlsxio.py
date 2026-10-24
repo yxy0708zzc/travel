@@ -130,17 +130,26 @@ def parse_distribution_xlsx(data: bytes) -> Dict[str, Any]:
 
 
 def parse_stations_xlsx(data: bytes) -> List[List[str]]:
-    """解析 2.xlsx 到发站对：每行 [出发站, 到达站]，跳过空行与同站对。"""
+    """解析 2.xlsx 到发站对：每行只取前 2 列 [出发站, 到达站]（第 3 列及以后
+    忽略，可放区段元数据）。前两列皆空的行视为空行（含"仅第 4/5 列有范围/
+    个数"的区段元数据行）：连续 1~3 个空行跳过继续读；连续 ≥4 个空行视为
+    表结束，其后内容不再读取。另跳过表头（「出发站/到达站」两格或合并单格），
+    否则会被当成一对站白费一次出题尝试。"""
     import openpyxl
     wb = openpyxl.load_workbook(BytesIO(data), read_only=True, data_only=True)
     rows = list(wb.active.iter_rows(values_only=True))
     wb.close()
     stations: List[List[str]] = []
+    blank_run = 0
     for r in rows:
-        if not r:
-            continue
-        a = str(r[0]).strip() if r[0] is not None else ""
+        a = str(r[0]).strip() if len(r) > 0 and r[0] is not None else ""
         b = str(r[1]).strip() if len(r) > 1 and r[1] is not None else ""
+        if not a and not b:      # 空行 / 区段元数据行：跳过并累计连续空行
+            blank_run += 1
+            if blank_run >= 4:   # 连续 ≥4 空行 = 表结束哨兵
+                break
+            continue
+        blank_run = 0
         # 跳过表头（「出发站/到达站」两格或合并单格），否则会被当成一对站白费一次出题尝试
         if "出发站" in a and "到达站" in (a + b):
             continue
